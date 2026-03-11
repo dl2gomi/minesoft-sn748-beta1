@@ -1,6 +1,8 @@
 import os
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Avoid "CuBLAS deterministic" warning when torch.use_deterministic_algorithms is used
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 def _detect_cpu_limit() -> None:
     """Detect available CPU cores from cgroup or fallback to nproc."""

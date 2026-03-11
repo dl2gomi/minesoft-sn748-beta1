@@ -320,7 +320,12 @@ class GLBConverter:
         # Handle alpha mode
         alpha_mode = params.alpha_mode
         if alpha_mode == AlphaMode.BLEND:
-            alpha_mode = AlphaMode.OPAQUE if np.all(alpha == 255) else alpha_mode
+            # If the baked alpha is effectively fully opaque everywhere, we can
+            # safely downgrade to OPAQUE to avoid unnecessary blending cost.
+            # alpha is a torch.Tensor in [0, 1], so compare against ~1.0.
+            is_fully_opaque = bool(torch.all(alpha >= 0.9999).item())
+            if is_fully_opaque:
+                alpha_mode = AlphaMode.OPAQUE
 
         # Apply alpha dithering if flag is set
         if alpha_mode == AlphaMode.DITHER:
