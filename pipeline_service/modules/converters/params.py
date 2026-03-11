@@ -7,7 +7,10 @@ class GLBConverterParams(OverridableModel):
     """GLB conversion parameters with automatic fallback to settings."""
     decimation_target: int = 1000000
     texture_size: int = 1024
-    alpha_mode: AlphaMode = AlphaMode.OPAQUE
+    # Default to BLEND so transparent materials can be represented.
+    # The converter will automatically downgrade to OPAQUE when the
+    # baked alpha channel is fully opaque.
+    alpha_mode: AlphaMode = AlphaMode.BLEND
     rescale: float = 1.0
     remesh: bool = True
     remesh_band: float = 1.0

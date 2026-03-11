@@ -23,9 +23,15 @@ trellis:
   shape_slat_cfg_strength: 3.0
   tex_slat_steps: 12
   tex_slat_cfg_strength: 9.5
-  pipeline_type: "1024_cascade"  # "512_simple", "1024_cascade"
+  pipeline_type: "512"  # "512", "1024_cascade"
   mode: "multidiffusion"  # "singleview", "multiview"
+  # Legacy boolean kept for compatibility; use multiview_mode instead for new behavior.
   multiview: false
+  # New multiview behavior:
+  # - "off": always single-view (no extra Qwen views)
+  # - "always": always multiview (current behavior when multiview=true)
+  # - "dynamic": decide per-image using clarifier VLM score
+  multiview_mode: "dynamic"
   num_samples: 1
   gpu: 0
 
@@ -44,7 +50,16 @@ qwen:
   prompt_path_base: "prompts/qwen_edit_prompt_v5.json"
   gpu: 0
   dtype: "bf16"
-  
+
+clarifier:
+  enabled: true
+  model_id: "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
+  gpu: 0
+  dtype: "bf16"
+  # Threshold on [0, 1]; lower scores mean geometry is harder to infer from a single view.
+  # If mode is "dynamic" and score < reconstructability_threshold, we enable multiview.
+  reconstructability_threshold: 0.3
+  max_new_tokens: 128
 
 # Background removal model settings
 background_removal:
@@ -58,8 +73,11 @@ background_removal:
 # GLB Converter settings
 glb_converter:
   decimation_target: 250000
-  texture_size: 2048
-  alpha_mode: "OPAQUE"
+  texture_size: 1536
+  # Use BLEND so transparent objects (glass, plastics, bottles) can preserve
+  # their alpha. The converter will automatically switch to OPAQUE when the
+  # baked alpha channel is fully opaque for a given asset.
+  alpha_mode: "BLEND"
   rescale: 1.0
   subdivisions: 1
   vertex_reproject: 0.1
@@ -99,3 +117,4 @@ model_versions:
     "Tooony133/dinov3-vitl16-pretrain-lvd1689m": "7d6ed51c4a5c416d5594d377c8f2b62ac99200b6"
     "Qwen/Qwen-Image-Edit-2511": "6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9"
     "lightx2v/Qwen-Image-Edit-2511-Lightning": "d74eba145674fd7e31b949324e148e21e7118abd"
+    "laion/CLIP-ViT-B-32-laion2B-s34B-b79K": "main"

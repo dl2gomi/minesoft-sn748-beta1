@@ -34,6 +34,7 @@ from modules.judge.duel_manager import DuelManager
 from modules.judge.vllm_judge_pipeline import VllmJudgePipeline
 from libs.trellis2.representations.mesh.base import MeshWithVoxel
 from modules.utils import image_grid, secure_randint, set_random_seed, decode_image, to_png_base64, save_files
+from modules.clarifier.clip_clarifier import CLIPClarifier, ClarifierResult
     
 class GenerationPipeline:
     """
@@ -73,6 +74,9 @@ class GenerationPipeline:
         else:
             self.judge_pipeline = None
             self.duel_manager = None
+
+        # Initialize clarifier (CLIP-based) for dynamic multiview decisions
+        self.clarifier = CLIPClarifier(settings.clarifier, settings.model_versions)
         
     async def startup(self) -> None:
         """Initialize all pipeline components."""
@@ -84,6 +88,8 @@ class GenerationPipeline:
         await self.mesh_pipeline.startup()
         if self.judge_pipeline is not None:
             await self.judge_pipeline.startup()
+        if self.settings.clarifier.enabled:
+            await self.clarifier.startup()
         
         logger.info("Warming up generator...")
         await self.warmup_generator()
@@ -101,6 +107,8 @@ class GenerationPipeline:
         await self.mesh_pipeline.shutdown()
         if self.judge_pipeline is not None:
             await self.judge_pipeline.shutdown()
+        if self.settings.clarifier.enabled:
+            await self.clarifier.shutdown()
 
         logger.info("Pipeline closed.")
 
@@ -133,22 +141,15 @@ class GenerationPipeline:
             if not grid_view_bytes:
                 logger.warning("Grid view generation failed during warmup")
 
-    async def generate_from_upload(self, image_bytes: bytes, seed: int) -> bytes:
+    async def generate_from_upload(self, image_bytes: bytes, seed: int) -> GenerationResponse:
         """
-        Generate 3D model from uploaded image file and return GLB as bytes.
-        
-        Args:
-            image_bytes: Raw image bytes from uploaded file
-            seed: Random seed for generation
-            output_type: Desired output type (MESH) (default: MESH)
-            
-        Returns:
-            GLB file as bytes
+        Generate 3D model from uploaded image file.
+
+        Returns full GenerationResponse (including glb_file_base64 as bytes and
+        clarifier/multiview metadata for logging).
         """
-        # Encode to base64
         image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-        
-        # Create request
+
         request = GenerationRequest(
             prompt_image=image_base64,
             prompt_type="image",
@@ -156,24 +157,24 @@ class GenerationPipeline:
         )
 
         response = await self.generate(request)
+        # Ensure GLB is bytes for streaming; generate() may leave it as bytes already
+        if isinstance(response.glb_file_base64, str):
+            response.glb_file_base64 = base64.b64decode(response.glb_file_base64)
+        return response
         
-        return response.glb_file_base64 # bytes
-        
-    def _edit_images(self, image: Image.Image, seed: int) -> list[Image.Image]:
+    def _edit_images(self, image: Image.Image, seed: int) -> tuple[list[Image.Image], Optional[float], bool, Optional[str]]:
         """
         Edit image based on current mode (multiview or base).
-        
-        Args:
-            image: Input image to edit
-            seed: Random seed for reproducibility
-            
+
         Returns:
-            List of edited images
+            (edited_images, clarifier_score, multiview_used, clarifier_explanation)
+            When clarifier is not run, clarifier_score and clarifier_explanation are None.
         """
+        clarifier_score: Optional[float] = None
+        clarifier_explanation: Optional[str] = None
 
         # 1 Always canonicalize the input with the base prompt first.
-        # This normalizes background and framing before generating any extra views.
-        base_prompt = self.prompting_library.promptings['base']
+        base_prompt = self.prompting_library.promptings["base"]
         logger.debug(f"Editing base view with prompt: {base_prompt}")
         base_images = list(self.qwen_edit.edit_image(
             model=self.qwen_pipeline,
@@ -182,16 +183,53 @@ class GenerationPipeline:
             prompting=base_prompt
         ))
 
-        # Base mode: return only the canonical base edits.
-        if not self.settings.trellis.multiview:
-            logger.info("Base mode: single view with background cleaning and rotation")
-            return base_images
+        # Decide whether multiview is needed based on configuration and clarifier.
+        multiview_mode = getattr(self.settings.trellis, "multiview_mode", "off")
+        needs_multiview = False
+
+        if multiview_mode == "off":
+            needs_multiview = False
+            logger.info("Multiview mode: off (single view only).")
+        elif multiview_mode == "always":
+            needs_multiview = True
+            logger.info("Multiview mode: always (force multiview).")
+        elif multiview_mode == "dynamic":
+            if not self.settings.clarifier.enabled:
+                logger.warning("Multiview mode is 'dynamic' but clarifier is disabled; falling back to single-view.")
+                needs_multiview = False
+            else:
+                result: ClarifierResult = self.clarifier.score_image(image)
+                clarifier_score = result.reconstructability_score
+                clarifier_explanation = result.explanation
+                logger.info(
+                    f"Clarifier reconstructability_score={result.reconstructability_score:.3f} "
+                    f"threshold={self.settings.clarifier.reconstructability_threshold:.3f} "
+                    f"explanation={result.explanation!r}"
+                )
+                needs_multiview = (
+                    result.reconstructability_score
+                    < self.settings.clarifier.reconstructability_threshold
+                )
+                if needs_multiview:
+                    logger.info("Clarifier decided: multiview is needed for this object.")
+                else:
+                    logger.info("Clarifier decided: single view is sufficient for this object.")
+        else:
+            logger.warning(f"Unknown multiview_mode={multiview_mode!r}; treating as 'off'.")
+            needs_multiview = False
+
+        if self.settings.trellis.multiview and multiview_mode == "off":
+            logger.info("Legacy trellis.multiview=True with multiview_mode='off'; enabling multiview for compatibility.")
+            needs_multiview = True
+
+        if not needs_multiview:
+            logger.info("Using single-view path after base edit.")
+            return base_images, clarifier_score, False, clarifier_explanation
 
         # 2 Multiview mode: generate views from the base-edited images.
-        logger.info("Multiview mode: generating multiple views from base-edited image")
-        views_prompt = self.prompting_library.promptings['views']
+        logger.info("Using multiview path: generating multiple views from base-edited image.")
+        views_prompt = self.prompting_library.promptings["views"]
 
-        # Put base views first, then additional view edits.
         edited_images: list[Image.Image] = list(base_images)
         for base_image in base_images:
             for prompt_text in views_prompt.prompt:
@@ -204,17 +242,14 @@ class GenerationPipeline:
                 )
                 edited_images.extend(result)
 
-        return edited_images
+        return edited_images, clarifier_score, True, clarifier_explanation
 
-    async def generate_mesh(self, request: GenerationRequest) -> tuple[list[MeshWithVoxel], list[Image.Image], list[Image.Image]]:
+    async def generate_mesh(self, request: GenerationRequest) -> tuple[list[MeshWithVoxel], list[Image.Image], list[Image.Image], Optional[float], bool, Optional[str]]:
         """
-        Generate mesh from Trellis pipeline, along with processed images.
-
-        Args:
-            request: Generation request with prompt and settings
+        Generate mesh from Trellis pipeline, along with processed images and clarifier metadata.
 
         Returns:
-            Tuple of (mesh, images_edited, images_without_background)
+            Tuple of (meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation)
         """
         # Set seed
         if request.seed < 0:
@@ -225,26 +260,17 @@ class GenerationPipeline:
         image = decode_image(request.prompt_image)
 
         # 1. Edit the image using Qwen Edit
-        images_edited = list(self._edit_images(image, request.seed))
-   
+        images_edited, clarifier_score, multiview_used, clarifier_explanation = self._edit_images(image, request.seed)
+
         # 2. Remove background
-        images_with_background = list(image.copy() for image in images_edited)
+        images_with_background = [img.copy() for img in images_edited]
         images_without_background = list(
             self.rmbg_module.remove_background(self.rmbg_pipeline, images_with_background)
         )
 
-        # --- TEMPORARY: save edited and no-bg images as PNGs before mesh generation ---
-        _debug_dir = Path(self.settings.output.output_dir) / "debug_pngs"
-        _debug_dir.mkdir(parents=True, exist_ok=True)
-        for i, img in enumerate(images_edited):
-            img.save(_debug_dir / f"edited_{i}.png")
-        for i, img in enumerate(images_without_background):
-            img.save(_debug_dir / f"no_bg_{i}.png")
-        # --- END TEMPORARY ---
-
         # Resolve Trellis parameters from request
         trellis_params: TrellisParams = request.trellis_params
-       
+
         # 3. Generate the 3D model
         meshes = self.mesh_generator.generate(
             model=self.mesh_pipeline,
@@ -255,7 +281,7 @@ class GenerationPipeline:
             ),
         )
 
-        return meshes, images_edited, images_without_background
+        return meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation
 
     def convert_mesh_to_glb(self, mesh: MeshWithVoxel, glbconv_params: GLBConverterParams) -> bytes:
         """
@@ -329,7 +355,7 @@ class GenerationPipeline:
         logger.info(f"Request received | Seed: {request.seed} | Prompt Type: {request.prompt_type.value}")
 
         # Generate mesh and get processed images
-        meshes, images_edited, images_without_background = await self.generate_mesh(request)
+        meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation = await self.generate_mesh(request)
 
         glb_trellis_result = None
         
@@ -370,7 +396,10 @@ class GenerationPipeline:
             generation_time=generation_time,
             glb_file_base64=glb_trellis_result.file_bytes if glb_trellis_result else None,
             image_edited_file_base64=image_edited_base64,
-            image_without_background_file_base64=image_no_bg_base64
+            image_without_background_file_base64=image_no_bg_base64,
+            clarifier_score=clarifier_score,
+            multiview_used=multiview_used,
+            clarifier_explanation=clarifier_explanation,
         )
         
         return response

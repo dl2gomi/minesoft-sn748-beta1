@@ -11,6 +11,7 @@ from modules.converters.settings import GLBConverterConfig
 from modules.mesh_generator.settings import TrellisConfig
 from modules.image_edit.settings import QwenConfig
 from modules.judge.settings import JudgeConfig
+from modules.clarifier.settings import ClarifierConfig
 
 config_dir = Path(__file__).parent
 config_file_dir = Path(__file__).parent.parent / "configuration.yaml"
@@ -49,6 +50,7 @@ class SettingsConf(BaseSettings):
     glb_converter: GLBConverterConfig
     model_versions: ModelVersionsConfig        
     judge: JudgeConfig
+    clarifier: ClarifierConfig
     
 def _load_yml_config(path: Path):
     """Classmethod returns YAML config"""

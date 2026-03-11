@@ -86,27 +86,40 @@ async def generate_from_base64(request: GenerationRequest) -> GenerationResponse
 async def generate(prompt_image_file: UploadFile = File(...), seed: int = Form(-1)) -> StreamingResponse:
     """
     Upload image file and generate 3D model as GLB buffer.
-    Returns binary GLB file directly.
+    Returns binary GLB file. Response headers include metadata for logging:
+    X-Generation-Time, X-Clarifier-Score, X-Multiview-Used, X-Clarifier-Explanation.
     """
     try:
         logger.info(f"Task received. Uploading image: {prompt_image_file.filename}")
 
-        # Generate GLB from uploaded file
-        glb_bytes = await asyncio.wait_for(
+        result = await asyncio.wait_for(
             pipeline.generate_from_upload(await prompt_image_file.read(), seed),
             timeout=settings.api.timeout
         )
-                                
-        # Wrap bytes in BytesIO for streaming
+
+        glb_bytes = result.glb_file_base64 if isinstance(result.glb_file_base64, bytes) else (base64.b64decode(result.glb_file_base64) if result.glb_file_base64 else b"")
         glb_buffer = BytesIO(glb_bytes)
-        buffer_size = len(glb_buffer.getvalue())
+        buffer_size = len(glb_bytes)
         glb_buffer.seek(0)
-        logger.info(f"Task completed. GLB size: {buffer_size} bytes")        
-     
+
+        headers = {"Content-Length": str(buffer_size)}
+        if result.generation_time is not None:
+            headers["X-Generation-Time"] = f"{result.generation_time:.3f}"
+        if result.clarifier_score is not None:
+            headers["X-Clarifier-Score"] = f"{result.clarifier_score:.4f}"
+        if result.multiview_used is not None:
+            headers["X-Multiview-Used"] = "true" if result.multiview_used else "false"
+        if result.clarifier_explanation:
+            # Truncate and sanitize for header (no newlines)
+            expl = (result.clarifier_explanation or "").replace("\n", " ").strip()[:256]
+            headers["X-Clarifier-Explanation"] = expl
+
+        logger.info(f"Task completed. GLB size: {buffer_size} bytes")
+
         return StreamingResponse(
             generate_chunks(glb_buffer),
             media_type="application/octet-stream",
-            headers={"Content-Length": str(buffer_size)}
+            headers=headers
         )
 
     except asyncio.TimeoutError:
