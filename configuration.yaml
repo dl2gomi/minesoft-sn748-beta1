@@ -26,7 +26,7 @@ trellis:
   pipeline_type: "1024_cascade"  # "512_simple", "1024_cascade"
   mode: "multidiffusion"  # "singleview", "multiview"
   multiview: false
-  num_samples: 2
+  num_samples: 1
   gpu: 0
 
 # Qwen model settings
@@ -41,7 +41,7 @@ qwen:
   width: 1024
   num_inference_steps: 4
   true_cfg_scale: 1.0
-  prompt_path_base: "prompts/qwen_edit_prompt_v3.json"
+  prompt_path_base: "prompts/qwen_edit_prompt_v5.json"
   gpu: 0
   dtype: "bf16"
   
@@ -78,7 +78,7 @@ glb_converter:
 
 # Judge model settings
 judge:
-  enabled: true
+  enabled: false
   vllm_port: 8095
   vllm_model_name: "zai-org/GLM-4.1V-9B-Thinking"
   vllm_revision: "17193d2147da3acd0da358eb251ef862b47e7545"

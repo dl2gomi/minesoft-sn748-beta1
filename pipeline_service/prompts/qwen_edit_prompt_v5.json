@@ -1,0 +1,11 @@
+{
+    "base": {
+        "positive": "Three-quarter (3/4) view, eye-level. Preserve the main subject(s) exactly as in the input image. If multiple objects are present, keep them all; do not remove secondary objects. Maintain their relative scale and placement. Ensure all objects are fully visible (no cropping) and centered in frame. Replace the background with a plain solid neutral color with strong contrast. Remove only background content (scene context) and any background text, logos, or watermarks. Preserve any text that is printed on or is part of the main subject(s). Do not stylize; preserve geometry, materials, and original colors. Even, neutral lighting; crisp edges; high detail."
+    },
+    "views": {
+        "positive": [
+            "<sks> front-left quarter view eye-level shot medium shot. Preserve the main subject(s); if multiple objects are present, keep them all. Maintain relative scale and placement; no cropping (fully visible). Plain solid neutral background with strong contrast. Remove background context and any background text, logos, or watermarks. Preserve any text that is printed on or is part of the main subject(s). No stylization; preserve geometry, materials, and original colors. Even neutral lighting; crisp edges; high detail.",
+            "<sks> front-right quarter view eye-level shot medium shot. Preserve the main subject(s); if multiple objects are present, keep them all. Maintain relative scale and placement; no cropping (fully visible). Plain solid neutral background with strong contrast. Remove background context and any background text, logos, or watermarks. Preserve any text that is printed on or is part of the main subject(s). No stylization; preserve geometry, materials, and original colors. Even neutral lighting; crisp edges; high detail."
+        ]
+    }
+}

@@ -4,6 +4,7 @@ import base64
 import io
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 from urllib import response
 
@@ -170,36 +171,40 @@ class GenerationPipeline:
             List of edited images
         """
 
-
-        if self.settings.trellis.multiview:
-            logger.info("Multiview mode: generating multiple views")
-            views_prompt = self.prompting_library.promptings['views']
-
-            edited_images = []
-            for prompt_text in views_prompt.prompt:
-                logger.debug(f"Editing view with prompt: {prompt_text}")
-                result = self.qwen_edit.edit_image(
-                    model=self.qwen_pipeline,
-                    prompt_image=image,
-                    seed=seed,
-                    prompting=prompt_text
-                )
-                edited_images.extend(result)
-                
-            edited_images.append(image.copy()) # Original image
-
-            return edited_images
-        
-        # Base mode: only clean background, single view (1 image)
-        logger.info("Base mode: single view with background cleaning and rotation")
+        # 1 Always canonicalize the input with the base prompt first.
+        # This normalizes background and framing before generating any extra views.
         base_prompt = self.prompting_library.promptings['base']
         logger.debug(f"Editing base view with prompt: {base_prompt}")
-        return self.qwen_edit.edit_image(
+        base_images = list(self.qwen_edit.edit_image(
             model=self.qwen_pipeline,
             prompt_image=image,
             seed=seed,
             prompting=base_prompt
-        )
+        ))
+
+        # Base mode: return only the canonical base edits.
+        if not self.settings.trellis.multiview:
+            logger.info("Base mode: single view with background cleaning and rotation")
+            return base_images
+
+        # 2 Multiview mode: generate views from the base-edited images.
+        logger.info("Multiview mode: generating multiple views from base-edited image")
+        views_prompt = self.prompting_library.promptings['views']
+
+        # Put base views first, then additional view edits.
+        edited_images: list[Image.Image] = list(base_images)
+        for base_image in base_images:
+            for prompt_text in views_prompt.prompt:
+                logger.debug(f"Editing view with prompt: {prompt_text}")
+                result = self.qwen_edit.edit_image(
+                    model=self.qwen_pipeline,
+                    prompt_image=base_image,
+                    seed=seed,
+                    prompting=prompt_text,
+                )
+                edited_images.extend(result)
+
+        return edited_images
 
     async def generate_mesh(self, request: GenerationRequest) -> tuple[list[MeshWithVoxel], list[Image.Image], list[Image.Image]]:
         """
@@ -227,6 +232,15 @@ class GenerationPipeline:
         images_without_background = list(
             self.rmbg_module.remove_background(self.rmbg_pipeline, images_with_background)
         )
+
+        # --- TEMPORARY: save edited and no-bg images as PNGs before mesh generation ---
+        _debug_dir = Path(self.settings.output.output_dir) / "debug_pngs"
+        _debug_dir.mkdir(parents=True, exist_ok=True)
+        for i, img in enumerate(images_edited):
+            img.save(_debug_dir / f"edited_{i}.png")
+        for i, img in enumerate(images_without_background):
+            img.save(_debug_dir / f"no_bg_{i}.png")
+        # --- END TEMPORARY ---
 
         # Resolve Trellis parameters from request
         trellis_params: TrellisParams = request.trellis_params
