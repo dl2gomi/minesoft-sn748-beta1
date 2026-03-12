@@ -13,6 +13,7 @@ class GenerationResponse(BaseModel):
     clarifier_score: Optional[float] = None
     multiview_used: Optional[bool] = None
     clarifier_explanation: Optional[str] = None
+    object_category: Optional[str] = None
 
     class Config:
         json_schema_extra = {
@@ -25,6 +26,6 @@ class GenerationResponse(BaseModel):
                 "clarifier_score": 0.45,
                 "multiview_used": True,
                 "clarifier_explanation": "Unseen sides are hard to infer.",
+                "object_category": "plastic",
             }
         }
-

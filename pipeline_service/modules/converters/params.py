@@ -25,6 +25,11 @@ class GLBConverterParams(OverridableModel):
     smooth_mesh: bool = False
     smooth_iterations: int = 5
     smooth_lambda: float = 0.5
+    # Material appearance tweaks (applied when baking textures)
+    roughness_scale: float = 1.0   # scale roughness (e.g. 0.7 = less rough)
+    roughness_bias: float = 0.0    # add to roughness after scale (e.g. 0.1 = floor)
+    color_saturation: float = 1.0  # 1 = no change, <1 = desaturate
+    color_brightness: float = 1.0  # 1 = no change, <1 = darker
     
     
     @classmethod

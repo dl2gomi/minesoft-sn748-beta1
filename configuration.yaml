@@ -41,8 +41,10 @@ qwen:
   base_model_path: "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
   lora_path: "lightx2v/Qwen-Image-Edit-2511-Lightning"
   fuse_lightning_lora: true
-  lora_angles_path: "" 
+  # Hugging Face repo for the multiple-angles LoRA (same style as lora_path). Leave empty to disable.
+  lora_angles_path: "fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA"
   lora_angles_filename: "qwen-image-edit-2511-multiple-angles-lora.safetensors"
+  lora_angles_weight: 0.9  # fal recommends 0.8-1.0 for angle LoRA
   height: 1024
   width: 1024
   num_inference_steps: 4
@@ -92,6 +94,12 @@ glb_converter:
   smooth_mesh: true
   smooth_iterations: 5
   smooth_lambda: 0.5
+  # Optional: make materials less rough (e.g. roughness_scale: 0.7, roughness_bias: 0.1)
+  roughness_scale: 0.7
+  roughness_bias: 0.1
+  # Optional: reduce bright/saturated look (e.g. color_saturation: 0.85, color_brightness: 0.95)
+  color_saturation: 0.85
+  # color_brightness: 1.0
   gpu: 0
 
 # Judge model settings
@@ -117,4 +125,5 @@ model_versions:
     "Tooony133/dinov3-vitl16-pretrain-lvd1689m": "7d6ed51c4a5c416d5594d377c8f2b62ac99200b6"
     "Qwen/Qwen-Image-Edit-2511": "6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9"
     "lightx2v/Qwen-Image-Edit-2511-Lightning": "d74eba145674fd7e31b949324e148e21e7118abd"
+    "fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA": "main"
     "laion/CLIP-ViT-B-32-laion2B-s34B-b79K": "main"

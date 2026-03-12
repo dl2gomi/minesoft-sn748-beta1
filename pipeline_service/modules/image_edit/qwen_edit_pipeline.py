@@ -65,17 +65,20 @@ class QwenEditPipeline(ImageEditPipeline[QwenImageEditPlusPipeline]):
                 logger.warning("Lightning LoRA fusion requested but failed; using unfused lightning adapter")
 
         if self.settings.lora_angles_path:
+            lora_angles_revision = self.model_versions.get_revision(self.settings.lora_angles_path)
             pipe.load_lora_weights(
                 self.settings.lora_angles_path,
                 weight_name=self.settings.lora_angles_filename,
+                revision=lora_angles_revision,
                 adapter_name="angles",
             )
+            angles_weight = getattr(self.settings, "lora_angles_weight", 0.9)
             if lightning_fused:
-                pipe.set_adapters(["angles"], adapter_weights=[1.0])
-                logger.info("Loaded angles LoRA with fused lightning LoRA (multiview mode)")
+                pipe.set_adapters(["angles"], adapter_weights=[angles_weight])
+                logger.info(f"Loaded angles LoRA (weight={angles_weight}) with fused lightning LoRA (multiview mode)")
             else:
-                pipe.set_adapters(["lightning", "angles"], adapter_weights=[1.0, 1.0])
-                logger.info("Loaded dual LoRAs: lightning + angles (multiview mode)")
+                pipe.set_adapters(["lightning", "angles"], adapter_weights=[1.0, angles_weight])
+                logger.info(f"Loaded dual LoRAs: lightning + angles (weight={angles_weight}) (multiview mode)")
 
         self.pipe = pipe.to(self.device)
         load_time = time.time() - t1

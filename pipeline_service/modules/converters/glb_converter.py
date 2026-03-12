@@ -314,6 +314,17 @@ class GLBConverter:
         alpha = attributes[..., attr_layout['alpha']]
         occlusion_channel  = torch.ones_like(metallic)
 
+        # Reduce apparent roughness so materials look less flat/matte
+        roughness = (roughness * params.roughness_scale + params.roughness_bias).clamp(0.0, 1.0)
+
+        # Reduce brightness and/or saturation of base color if requested
+        if params.color_brightness != 1.0:
+            base_color = (base_color * params.color_brightness).clamp(0.0, 1.0)
+        if params.color_saturation != 1.0:
+            # Luminance (linear weights)
+            luma = base_color[..., 0:1] * 0.2126 + base_color[..., 1:2] * 0.7152 + base_color[..., 2:3] * 0.0722
+            base_color = (luma + (base_color - luma) * params.color_saturation).clamp(0.0, 1.0)
+
         # Adjust alpha with gamma
         alpha = alpha.pow(params.alpha_gamma)
         

@@ -93,7 +93,7 @@ async def generate(prompt_image_file: UploadFile = File(...), seed: int = Form(-
         logger.info(f"Task received. Uploading image: {prompt_image_file.filename}")
 
         result = await asyncio.wait_for(
-            pipeline.generate_from_upload(await prompt_image_file.read(), seed),
+            pipeline.generate_from_upload(await prompt_image_file.read(), seed, input_filename=prompt_image_file.filename or None),
             timeout=settings.api.timeout
         )
 

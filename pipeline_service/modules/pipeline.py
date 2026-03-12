@@ -10,10 +10,12 @@ from urllib import response
 
 from PIL import Image
 from modules.converters.params import GLBConverterParams
+from modules.converters.category_presets import get_glb_overrides_for_category
 import torch
 import gc
 
-from config.settings import SettingsConf
+from config.settings import SettingsConf, config_dir
+from config.category_config import load_category_config
 from config.prompting_library import PromptingLibrary
 from logger_config import logger
 from schemas.requests import GenerationRequest
@@ -67,6 +69,13 @@ class GenerationPipeline:
         self.mesh_generator = MeshGeneratorModule(TrellisParams.from_settings(settings.trellis))
         self.glb_converter = GLBConverter(settings.glb_converter)
 
+        # Load category config (CLIP prompts + GLB presets) from YAML
+        category_config_path = Path(settings.clarifier.category_config_path) if getattr(settings.clarifier, "category_config_path", None) else config_dir.parent / "category_config.yaml"
+        self._category_config = load_category_config(category_config_path)
+        self._category_glb_presets = self._category_config["glb_presets"]
+        category_prompts = self._category_config["categories"]
+        category_order = list(category_prompts.keys())
+
         # Initialize Judge module
         if settings.judge.enabled:
             self.judge_pipeline = VllmJudgePipeline(settings.judge)
@@ -76,8 +85,13 @@ class GenerationPipeline:
             self.duel_manager = None
 
         # Initialize clarifier (CLIP-based) for dynamic multiview decisions
-        self.clarifier = CLIPClarifier(settings.clarifier, settings.model_versions)
-        
+        self.clarifier = CLIPClarifier(
+            settings.clarifier,
+            settings.model_versions,
+            category_prompts=category_prompts,
+            category_order=category_order,
+        )
+
     async def startup(self) -> None:
         """Initialize all pipeline components."""
         logger.info("Starting pipeline")
@@ -141,7 +155,7 @@ class GenerationPipeline:
             if not grid_view_bytes:
                 logger.warning("Grid view generation failed during warmup")
 
-    async def generate_from_upload(self, image_bytes: bytes, seed: int) -> GenerationResponse:
+    async def generate_from_upload(self, image_bytes: bytes, seed: int, input_filename: Optional[str] = None) -> GenerationResponse:
         """
         Generate 3D model from uploaded image file.
 
@@ -153,7 +167,8 @@ class GenerationPipeline:
         request = GenerationRequest(
             prompt_image=image_base64,
             prompt_type="image",
-            seed=seed
+            seed=seed,
+            input_filename=input_filename,
         )
 
         response = await self.generate(request)
@@ -244,12 +259,12 @@ class GenerationPipeline:
 
         return edited_images, clarifier_score, True, clarifier_explanation
 
-    async def generate_mesh(self, request: GenerationRequest) -> tuple[list[MeshWithVoxel], list[Image.Image], list[Image.Image], Optional[float], bool, Optional[str]]:
+    async def generate_mesh(self, request: GenerationRequest) -> tuple[list[MeshWithVoxel], list[Image.Image], list[Image.Image], Optional[float], bool, Optional[str], Optional[str]]:
         """
         Generate mesh from Trellis pipeline, along with processed images and clarifier metadata.
 
         Returns:
-            Tuple of (meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation)
+            Tuple of (meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category)
         """
         # Set seed
         if request.seed < 0:
@@ -268,8 +283,27 @@ class GenerationPipeline:
             self.rmbg_module.remove_background(self.rmbg_pipeline, images_with_background)
         )
 
+        # 2b. Classify main object category (for GLB material presets); use first image after rembg
+        object_category: Optional[str] = None
+        if self.settings.clarifier.enabled:
+            try:
+                object_category = self.clarifier.classify_category(images_without_background[0])
+            except Exception as e:
+                logger.warning(f"Category classification failed: {e}; using default GLB params.")
+        if object_category:
+            logger.info(f"Object category for GLB preset: {object_category}")
+
         # Resolve Trellis parameters from request
         trellis_params: TrellisParams = request.trellis_params
+
+        # Temporary debug: save the image list fed to Trellis to files (named after input image)
+        stem = Path(request.input_filename).stem if request.input_filename else datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        save_dir = self.settings.output.output_dir / "trellis_inputs"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        for i, img in enumerate(images_without_background):
+            path = save_dir / f"{stem}_trellis_{i}.png"
+            img.save(path)
+        logger.info(f"Temporary debug: saved {len(images_without_background)} Trellis input images to {save_dir} as {stem}_trellis_*.png")
 
         # 3. Generate the 3D model
         meshes = self.mesh_generator.generate(
@@ -281,21 +315,28 @@ class GenerationPipeline:
             ),
         )
 
-        return meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation
+        return meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category
 
-    def convert_mesh_to_glb(self, mesh: MeshWithVoxel, glbconv_params: GLBConverterParams) -> bytes:
+    def convert_mesh_to_glb(self, mesh: MeshWithVoxel, glbconv_params: Optional[GLBConverterParams.Overrides], object_category: Optional[str] = None) -> bytes:
         """
         Convert mesh to GLB format using GLBConverter.
 
         Args:
             mesh: The mesh to convert
-            glbconv_params: Optional override parameters for GLB conversion
+            glbconv_params: Optional override parameters for GLB conversion (from request)
+            object_category: Optional category from classifier (glass, metal, etc.) to apply material preset
 
         Returns:
             GLB file as bytes
         """
         start_time = time.time()
-        glb_mesh = self.glb_converter.convert(mesh, params=glbconv_params)
+        # Merge category-based preset with request overrides (category first, then request overrides win)
+        category_overrides = get_glb_overrides_for_category(object_category, presets=self._category_glb_presets)
+        request_dict = (glbconv_params.model_dump(exclude_none=True) if glbconv_params else {})
+        merged = {**category_overrides, **request_dict}
+        allowed_keys = set(GLBConverterParams.model_fields)
+        params_filtered = GLBConverterParams.Overrides(**{k: v for k, v in merged.items() if k in allowed_keys}) if merged else glbconv_params
+        glb_mesh = self.glb_converter.convert(mesh, params=params_filtered)
 
         buffer = io.BytesIO()
         glb_mesh.export(file_obj=buffer, file_type="glb", extension_webp=False)
@@ -355,7 +396,7 @@ class GenerationPipeline:
         logger.info(f"Request received | Seed: {request.seed} | Prompt Type: {request.prompt_type.value}")
 
         # Generate mesh and get processed images
-        meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation = await self.generate_mesh(request)
+        meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category = await self.generate_mesh(request)
 
         glb_trellis_result = None
         
@@ -365,7 +406,7 @@ class GenerationPipeline:
         glb_trellis_results = []
         if meshes:
             for mesh in meshes:
-                glb_bytes = self.convert_mesh_to_glb(mesh, request.glbconv_params)
+                glb_bytes = self.convert_mesh_to_glb(mesh, request.glbconv_params, object_category)
                 glb_trellis_results.append(TrellisResult(file_bytes=glb_bytes))
 
         # Judge the meshes
@@ -400,6 +441,7 @@ class GenerationPipeline:
             clarifier_score=clarifier_score,
             multiview_used=multiview_used,
             clarifier_explanation=clarifier_explanation,
+            object_category=object_category,
         )
         
         return response

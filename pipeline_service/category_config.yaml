@@ -1,0 +1,53 @@
+# Object category config: CLIP prompts for classification and GLB material presets per category.
+# Edit this file to add/change categories or presets without changing code.
+
+categories:
+  glass:
+    - "a glass bottle"
+    - "a glass jar or container"
+    - "transparent glass product"
+  metal:
+    - "a metal can or container"
+    - "a metal product"
+    - "shiny metal object"
+  plastic:
+    - "a plastic bottle"
+    - "a plastic product or container"
+    - "plastic packaging"
+  organic:
+    - "a fabric or plush toy"
+    - "a soft toy or stuffed animal"
+    - "fruit or food product"
+    - "organic or natural material"
+  generic:
+    - "a product"
+    - "an object"
+    - "a generic item"
+
+# GLBConverterParams overrides per category (only material-related keys are typically used).
+glb_presets:
+  glass:
+    roughness_scale: 0.45
+    roughness_bias: 0.05
+    color_saturation: 0.9
+    color_brightness: 1.0
+  metal:
+    roughness_scale: 0.5
+    roughness_bias: 0.08
+    color_saturation: 0.9
+    color_brightness: 1.0
+  plastic:
+    roughness_scale: 0.7
+    roughness_bias: 0.1
+    color_saturation: 0.85
+    color_brightness: 1.0
+  organic:
+    roughness_scale: 0.85
+    roughness_bias: 0.12
+    color_saturation: 0.9
+    color_brightness: 1.0
+  generic:
+    roughness_scale: 0.7
+    roughness_bias: 0.1
+    color_saturation: 0.85
+    color_brightness: 1.0

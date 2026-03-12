@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 import time
 
@@ -8,7 +9,8 @@ import torch
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
-from config.settings import ModelVersionsConfig
+from config.settings import ModelVersionsConfig, config_dir
+from config.category_config import load_category_config
 from logger_config import logger
 
 from .settings import ClarifierConfig
@@ -24,13 +26,18 @@ class ClarifierResult:
 
 class CLIPClarifier:
     """
-    Clarifier that estimates how well a full 3D object (including unseen sides)
-    can be reconstructed from a single image, using a CLIP similarity score
-    between the image and two textual anchors: "easy to reconstruct" vs
-    "hard to reconstruct".
+    Clarifier that scores how recognizable the object in the image is, using CLIP
+    similarity to "easy to recognize" vs "hard to recognize" text anchors.
+    High score → object is recognizable → single view; low score → multiview.
     """
 
-    def __init__(self, settings: ClarifierConfig, model_versions: ModelVersionsConfig) -> None:
+    def __init__(
+        self,
+        settings: ClarifierConfig,
+        model_versions: ModelVersionsConfig,
+        category_prompts: Optional[dict[str, list[str]]] = None,
+        category_order: Optional[list[str]] = None,
+    ) -> None:
         self.settings = settings
         self.model_id = settings.model_id
         self.gpu_index = settings.gpu
@@ -40,15 +47,27 @@ class CLIPClarifier:
         self._model: Optional[CLIPModel] = None
         self._model_revision: Optional[str] = model_versions.get_revision(self.model_id)
 
-        # Text anchors for "easy" vs "hard" reconstructability.
+        # Text anchors: recognizability (easy = you can tell what the object is → single view; hard = you cannot → multiview).
         self._easy_prompts = [
-            "a simple logistics object whose unseen sides are very predictable from this single view",
-            "a box or package where the back and sides are almost the same as the front",
+            "a clear photograph of an object that is easy to recognize and identify",
+            "an object you can clearly tell what it is",
+            "a well-defined product or object whose type is obvious from the image",
         ]
         self._hard_prompts = [
-            "a logistics object whose unseen sides are difficult to infer and may have different graphics or geometry",
-            "a product package with complex or asymmetric design where the back and sides are not obvious from the front",
+            "an unclear or ambiguous image where the object is hard to recognize",
+            "an object you cannot tell what it is",
+            "a blurry, abstract, or confusing image where the subject is not identifiable",
         ]
+
+        # Coarse material/category labels: from caller (pipeline loads YAML) or load from YAML here (YAML is main source; loader fallback only if file missing).
+        if category_prompts and category_order:
+            self._category_prompts = dict(category_prompts)
+            self._category_order = list(category_order)
+        else:
+            path = Path(settings.category_config_path) if getattr(settings, "category_config_path", None) else config_dir.parent / "category_config.yaml"
+            loaded = load_category_config(path)
+            self._category_prompts = loaded["categories"]
+            self._category_order = list(loaded["categories"].keys())
 
     @property
     def device(self) -> torch.device:
@@ -158,20 +177,63 @@ class CLIPClarifier:
             f"(easy_prob={probs[0].item():.3f}, hard_prob={probs[1].item():.3f})"
         )
 
-        # Provide a coarse natural-language explanation bucket.
+        # Explanation buckets (recognizability).
         if score < 0.2:
-            explanation = "Unseen sides are almost impossible to infer from this single view."
+            explanation = "The object in the image is very hard to recognize or identify."
         elif score < 0.4:
-            explanation = "Unseen sides are hard to infer and would often require guessing."
+            explanation = "The object is difficult to recognize; the image may be ambiguous or unclear."
         elif score < 0.6:
-            explanation = "Unseen sides are moderately inferable but some guessing is needed."
+            explanation = "The object is somewhat recognizable but not clearly identifiable."
         elif score < 0.8:
-            explanation = "Unseen sides are largely predictable from this view."
+            explanation = "The object is clearly recognizable from the image."
         else:
-            explanation = "Unseen sides are very easy to infer; geometry is almost fully determined."
+            explanation = "The object is very easy to recognize and identify."
 
         return ClarifierResult(
             reconstructability_score=score,
             explanation=explanation,
         )
+
+    def classify_category(self, image: Image.Image) -> Optional[str]:
+        """
+        Classify the main object in the image into a coarse material category using CLIP.
+        Intended to be run after background removal. Returns one of: glass, metal, plastic, organic, generic.
+        Returns None if the clarifier is disabled or not loaded.
+        """
+        if not self.settings.enabled or self._processor is None or self._model is None:
+            return None
+
+        self._ensure_ready()
+        assert self._processor is not None
+        assert self._model is not None
+
+        all_prompts: list[str] = []
+        category_ranges: list[tuple[int, int]] = []
+        for cat in self._category_order:
+            prompts = self._category_prompts[cat]
+            start = len(all_prompts)
+            all_prompts.extend(prompts)
+            category_ranges.append((start, len(all_prompts)))
+
+        inputs = self._processor(
+            text=all_prompts,
+            images=image,
+            return_tensors="pt",
+            padding=True,
+        ).to(self.device)
+
+        with torch.no_grad():
+            outputs = self._model(**inputs)
+            logits_per_image = outputs.logits_per_image[0]  # (num_texts,)
+
+        best_cat = "generic"
+        best_score = -float("inf")
+        for cat, (start, end) in zip(self._category_order, category_ranges):
+            score = float(logits_per_image[start:end].mean().item())
+            if score > best_score:
+                best_score = score
+                best_cat = cat
+
+        logger.info(f"Category classifier: {best_cat} (score={best_score:.2f})")
+        return best_cat
 

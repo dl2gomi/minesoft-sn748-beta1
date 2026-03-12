@@ -13,6 +13,9 @@ class GenerationRequest(BaseModel):
     seed: int = -1
     render_grid_view: bool = False
 
+    # Optional: original filename (e.g. from upload); used for debug output naming
+    input_filename: Optional[str] = None
+
     # Trellis parameters
     trellis_params: Optional[TrellisParamsOverrides] = None
     glbconv_params: Optional[GLBConverterParamsOverrides] = None

@@ -11,6 +11,7 @@ class QwenConfig(ModelConfig):
     fuse_lightning_lora: bool = True
     lora_angles_path: str = "" 
     lora_angles_filename: str = "qwen-image-edit-2511-multiple-angles-lora.safetensors"
+    lora_angles_weight: float = 0.9  # fal recommends 0.8-1.0; 0.9 for stronger angle change
     height: int = 1024
     width: int = 1024
     num_inference_steps: int = 8
