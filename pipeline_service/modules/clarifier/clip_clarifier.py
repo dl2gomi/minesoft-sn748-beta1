@@ -37,6 +37,7 @@ class CLIPClarifier:
         model_versions: ModelVersionsConfig,
         category_prompts: Optional[dict[str, list[str]]] = None,
         category_order: Optional[list[str]] = None,
+        category_confidence_threshold: Optional[float] = None,
     ) -> None:
         self.settings = settings
         self.model_id = settings.model_id
@@ -63,11 +64,17 @@ class CLIPClarifier:
         if category_prompts and category_order:
             self._category_prompts = dict(category_prompts)
             self._category_order = list(category_order)
+            self._category_confidence_threshold = (
+                float(category_confidence_threshold)
+                if category_confidence_threshold is not None
+                else 0.45
+            )
         else:
             path = Path(settings.category_config_path) if getattr(settings, "category_config_path", None) else config_dir.parent / "category_config.yaml"
             loaded = load_category_config(path)
             self._category_prompts = loaded["categories"]
             self._category_order = list(loaded["categories"].keys())
+            self._category_confidence_threshold = float(loaded.get("category_confidence_threshold", 0.45))
 
     @property
     def device(self) -> torch.device:
@@ -211,6 +218,10 @@ class CLIPClarifier:
         category_ranges: list[tuple[int, int]] = []
         for cat in self._category_order:
             prompts = self._category_prompts[cat]
+            if not prompts:
+                # Skip empty prompt lists to avoid degenerate averages.
+                category_ranges.append((len(all_prompts), len(all_prompts)))
+                continue
             start = len(all_prompts)
             all_prompts.extend(prompts)
             category_ranges.append((start, len(all_prompts)))
@@ -226,14 +237,36 @@ class CLIPClarifier:
             outputs = self._model(**inputs)
             logits_per_image = outputs.logits_per_image[0]  # (num_texts,)
 
-        best_cat = "generic"
-        best_score = -float("inf")
+        # Compute average logit per category, then softmax over categories to get probabilities.
+        categories: list[str] = []
+        scores: list[float] = []
         for cat, (start, end) in zip(self._category_order, category_ranges):
+            if end <= start:
+                continue
             score = float(logits_per_image[start:end].mean().item())
-            if score > best_score:
-                best_score = score
-                best_cat = cat
+            categories.append(cat)
+            scores.append(score)
 
-        logger.info(f"Category classifier: {best_cat} (score={best_score:.2f})")
-        return best_cat
+        if not categories:
+            logger.warning("Category classifier: no valid category prompts; returning generic.")
+            return "generic"
+
+        scores_tensor = torch.tensor(scores, dtype=torch.float32, device=self.device)
+        probs = torch.softmax(scores_tensor, dim=0)
+        best_idx = int(torch.argmax(probs).item())
+        best_cat = categories[best_idx]
+        best_prob = float(probs[best_idx].item())
+
+        threshold = float(getattr(self, "_category_confidence_threshold", 0.45))
+        if best_prob < threshold:
+            chosen = "generic"
+        else:
+            chosen = best_cat
+
+        probs_list = probs.detach().cpu().tolist()
+        scores_str = ", ".join(f"{c}:{p:.2f}" for c, p in zip(categories, probs_list))
+        logger.info(
+            f"Category classifier: {chosen} (best={best_cat}, p={best_prob:.2f}, thr={threshold:.2f}) | probs={{{scores_str}}}"
+        )
+        return chosen
 

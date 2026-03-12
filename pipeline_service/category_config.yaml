@@ -3,26 +3,22 @@
 
 categories:
   glass:
-    - "a glass bottle"
-    - "a glass jar or container"
-    - "transparent glass product"
+    - "a clear transparent glass bottle on a plain background"
+    - "a glass jar or container made of transparent glass"
+    - "a shiny glass cup or drinking glass"
   metal:
-    - "a metal can or container"
-    - "a metal product"
-    - "shiny metal object"
+    - "a polished shiny metal can on a plain background"
+    - "a stainless steel tool or object made of metal"
+    - "a chrome metallic product with reflective surface"
   plastic:
-    - "a plastic bottle"
-    - "a plastic product or container"
-    - "plastic packaging"
+    - "a smooth colorful plastic bottle on a plain background"
+    - "a plastic container or packaging made of plastic"
+    - "a plastic household product with a matte plastic surface"
   organic:
-    - "a fabric or plush toy"
-    - "a soft toy or stuffed animal"
-    - "fruit or food product"
-    - "organic or natural material"
-  generic:
-    - "a product"
-    - "an object"
-    - "a generic item"
+    - "a fabric or plush toy made of soft material"
+    - "a soft toy or stuffed animal with fabric texture"
+    - "a piece of fruit or food with organic surface"
+    - "an object made of wood, fabric, or other organic material"
 
 # GLBConverterParams overrides per category (only material-related keys are typically used).
 glb_presets:
@@ -51,3 +47,5 @@ glb_presets:
     roughness_bias: 0.1
     color_saturation: 0.85
     color_brightness: 1.0
+
+category_confidence_threshold: 0.45

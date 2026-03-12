@@ -12,10 +12,17 @@ import yaml
 # Fallback when category_config.yaml is missing: single "generic" category and generic GLB params.
 _FALLBACK_CONFIG: dict[str, Any] = {
     "categories": {
-        "generic": [
-            "a product",
-            "an object",
-            "a generic item",
+        "glass": [
+            "a clear transparent glass bottle on a plain background",
+        ],
+        "metal": [
+            "a polished shiny metal object on a plain background",
+        ],
+        "plastic": [
+            "a smooth colorful plastic bottle on a plain background",
+        ],
+        "organic": [
+            "an object made of wood, fabric, or other organic material",
         ],
     },
     "glb_presets": {
@@ -26,6 +33,7 @@ _FALLBACK_CONFIG: dict[str, Any] = {
             "color_brightness": 1.0,
         },
     },
+    "category_confidence_threshold": 0.45,
 }
 
 
@@ -55,6 +63,7 @@ def load_category_config(path: Path) -> dict[str, Any]:
 
     categories = data.get("categories")
     glb_presets = data.get("glb_presets")
+    threshold = data.get("category_confidence_threshold", _FALLBACK_CONFIG["category_confidence_threshold"])
 
     if not isinstance(categories, dict) or not categories:
         raise ValueError("Category config must contain a non-empty 'categories' dict (category name -> list of CLIP prompts)")
@@ -70,4 +79,5 @@ def load_category_config(path: Path) -> dict[str, Any]:
     return {
         "categories": categories,
         "glb_presets": glb_presets,
+        "category_confidence_threshold": float(threshold),
     }

@@ -75,6 +75,7 @@ class GenerationPipeline:
         self._category_glb_presets = self._category_config["glb_presets"]
         category_prompts = self._category_config["categories"]
         category_order = list(category_prompts.keys())
+        self._category_confidence_threshold: float = float(self._category_config.get("category_confidence_threshold", 0.45))
 
         # Initialize Judge module
         if settings.judge.enabled:
@@ -90,6 +91,7 @@ class GenerationPipeline:
             settings.model_versions,
             category_prompts=category_prompts,
             category_order=category_order,
+            category_confidence_threshold=self._category_confidence_threshold,
         )
 
     async def startup(self) -> None:
