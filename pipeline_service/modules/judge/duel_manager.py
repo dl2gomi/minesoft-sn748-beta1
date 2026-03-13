@@ -61,8 +61,8 @@ class DuelManager:
             else ""
         )
 
-        # Lower penalty = better; draw defaults to second candidate
-        winner = -1 if score1 < score2 else 1
+        # Lower penalty = better. Tie: prefer first candidate (fully deterministic).
+        winner = -1 if score1 <= score2 else 1
 
         logger.debug(
             f"Duel scores — Candidate 1: {score1:.1f} (direct={res_direct.penalty_1}, swapped={res_swapped.penalty_2}) | "

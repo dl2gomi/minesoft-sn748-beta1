@@ -315,13 +315,13 @@ class GenerationPipeline:
         trellis_params: TrellisParams = request.trellis_params
 
         # Temporary debug: save the image list fed to Trellis to files (named after input image)
-        stem = Path(request.input_filename).stem if request.input_filename else datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        save_dir = self.settings.output.output_dir / "trellis_inputs"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        for i, img in enumerate(images_without_background):
-            path = save_dir / f"{stem}_trellis_{i}.png"
-            img.save(path)
-        logger.info(f"Temporary debug: saved {len(images_without_background)} Trellis input images to {save_dir} as {stem}_trellis_*.png")
+        # stem = Path(request.input_filename).stem if request.input_filename else datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        # save_dir = self.settings.output.output_dir / "trellis_inputs"
+        # save_dir.mkdir(parents=True, exist_ok=True)
+        # for i, img in enumerate(images_without_background):
+        #     path = save_dir / f"{stem}_trellis_{i}.png"
+        #     img.save(path)
+        # logger.info(f"Temporary debug: saved {len(images_without_background)} Trellis input images to {save_dir} as {stem}_trellis_*.png")
 
         # 3. Generate the 3D model
         meshes = self.mesh_generator.generate(

@@ -9,4 +9,4 @@ images/
 .env
 build/
 *.egg-info/
-pipeline_service/libs/o-voxel/third_party/eigen
+third_party/eigen

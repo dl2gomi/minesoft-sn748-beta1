@@ -101,7 +101,7 @@ glb_presets:
     color_brightness: 0.98
     alpha_mode: OPAQUE
   mixed:
-    roughness_scale: 0.75
+    roughness_scale: 0.60
     roughness_bias: 0.10
     color_saturation: 0.9
     color_brightness: 0.98

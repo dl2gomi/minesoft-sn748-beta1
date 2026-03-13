@@ -88,5 +88,6 @@ fi
 
 echo "STARTING MAIN FASTAPI SERVICE (Base Env)"
 
-# Start the main pipeline service (foreground)
+# Ensure CWD is /workspace so relative paths (e.g. output_dir, config) resolve correctly in container
+cd /workspace
 exec python serve.py
