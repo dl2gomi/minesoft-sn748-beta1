@@ -8,7 +8,7 @@ from openai import AsyncOpenAI
 
 from logger_config import logger
 from .judge_pipeline import JudgePipeline
-from .prompting import SYSTEM_PROMPT, USER_PROMPT_IMAGE
+from .prompting import SYSTEM_PROMPT
 from .schemas import JudgeResponse
 from .settings import JudgeConfig
 from modules.utils import set_random_seed
@@ -59,68 +59,60 @@ class VllmJudgePipeline(JudgePipeline):
         img2_b64: str,
         seed: int,
     ) -> JudgeResponse:
-        """Call vLLM to compare two candidate images against a prompt image."""
+        """Call vLLM to compare two candidate images. Uses 2 separate calls (1 image each)
+        because GLM-4.1V / vLLM allows at most 1 image per request."""
         assert self.client is not None, "VllmJudgePipeline is not initialized."
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Image prompt to generate 3D model:"},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{prompt_b64}"},
-                    },
-                    {"type": "text", "text": "First 3D model (4 different views):"},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{img1_b64}"},
-                    },
-                    {"type": "text", "text": "Second 3D model (4 different views):"},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{img2_b64}"},
-                    },
-                    {"type": "text", "text": USER_PROMPT_IMAGE},
-                ],
-            },
-        ]
-        response_format = {
+        # Single-image response schema for each call
+        single_schema = {
             "type": "json_schema",
             "json_schema": {
-                "name": "judge-response",
-                "schema": JudgeResponse.model_json_schema(),
+                "name": "judge-single",
+                "schema": {
+                    "type": "object",
+                    "properties": {"penalty": {"type": "integer"}, "issues": {"type": "string"}},
+                    "required": ["penalty", "issues"],
+                },
             },
         }
+        user_text = (
+            "Rate this 3D model (4 views). Penalty 0-10 (0=perfect, 10=wrong). "
+            "Output: {\"penalty\": <0-10>, \"issues\": \"<brief>\"}"
+        )
 
-        # Set seed 
         set_random_seed(seed)
 
-        try:
+        async def one_call(img_b64: str) -> tuple[int, str]:
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                    ],
+                },
+            ]
             completion = await self.client.chat.completions.create(
                 model=self.settings.vllm_model_name,
                 messages=messages,
                 temperature=0.0,
-                max_tokens=32,
-                response_format=response_format,
+                max_tokens=64,
+                response_format=single_schema,
                 seed=seed,
             )
+            content = (completion.choices[0].message.content or "").strip()
+            penalty_match = re.search(r'"penalty":\s*(\d+)', content)
+            issues_match = re.search(r'"issues":\s*"([^"]*)"', content)
+            penalty = int(penalty_match.group(1)) if penalty_match else 5
+            issues = issues_match.group(1) if issues_match else ""
+            return penalty, issues
 
-            choice = completion.choices[0]
-            finish_reason = choice.finish_reason
-            if finish_reason == "length":
-                logger.warning("vLLM response was truncated due to max_tokens limit")
-
-            content = choice.message.content
-            if not content:
-                raise ValueError("Empty response from vLLM")
-
-            content = content.strip()
-            logger.debug(f"vLLM judge response (seed={seed}): {content}")
-
-            return self._parse_content(content, finish_reason)
-
+        try:
+            penalty_1, issues_1 = await one_call(img1_b64)
+            penalty_2, issues_2 = await one_call(img2_b64)
+            issues = f"1: {issues_1} | 2: {issues_2}" if (issues_1 or issues_2) else ""
+            return JudgeResponse(penalty_1=penalty_1, penalty_2=penalty_2, issues=issues)
         except Exception as e:
             logger.error(f"vLLM call failed: {e}")
             return JudgeResponse(penalty_1=5, penalty_2=5, issues="vLLM call failed")

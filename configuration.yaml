@@ -23,7 +23,7 @@ trellis:
   shape_slat_cfg_strength: 3.0
   tex_slat_steps: 12
   tex_slat_cfg_strength: 9.5
-  pipeline_type: "512"  # "512", "1024_cascade"
+  pipeline_type: "1024_cascade"  # "512", "1024_cascade"
   mode: "multidiffusion"  # "singleview", "multiview"
   # Legacy boolean kept for compatibility; use multiview_mode instead for new behavior.
   multiview: false
@@ -32,7 +32,7 @@ trellis:
   # - "always": always multiview (current behavior when multiview=true)
   # - "dynamic": decide per-image using clarifier VLM score
   multiview_mode: "dynamic"
-  num_samples: 1
+  num_samples: 2
   gpu: 0
 
 # Qwen model settings
@@ -44,7 +44,7 @@ qwen:
   # Hugging Face repo for the multiple-angles LoRA (same style as lora_path). Leave empty to disable.
   lora_angles_path: "fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA"
   lora_angles_filename: "qwen-image-edit-2511-multiple-angles-lora.safetensors"
-  lora_angles_weight: 0.9  # fal recommends 0.8-1.0 for angle LoRA
+  lora_angles_weight: 0.6  # fal recommends 0.8-1.0 for angle LoRA
   height: 1024
   width: 1024
   num_inference_steps: 4
@@ -74,8 +74,8 @@ background_removal:
 
 # GLB Converter settings
 glb_converter:
-  decimation_target: 250000
-  texture_size: 1536
+  decimation_target: 150000
+  texture_size: 2048
   # Use BLEND so transparent objects (glass, plastics, bottles) can preserve
   # their alpha. The converter will automatically switch to OPAQUE when the
   # baked alpha channel is fully opaque for a given asset.
@@ -83,7 +83,7 @@ glb_converter:
   rescale: 1.0
   subdivisions: 1
   vertex_reproject: 0.1
-  alpha_gamma: 2.0
+  alpha_gamma: 1.0
   remesh: true
   remesh_band: 1
   remesh_project: 0.1
@@ -92,7 +92,7 @@ glb_converter:
   mesh_cluster_smooth_strength: 0.15
   mesh_cluster_threshold_cone_half_angle: 90
   smooth_mesh: true
-  smooth_iterations: 5
+  smooth_iterations: 4
   smooth_lambda: 0.5
   # Optional: make materials less rough (e.g. roughness_scale: 0.7, roughness_bias: 0.1)
   roughness_scale: 0.7
@@ -102,9 +102,22 @@ glb_converter:
   # color_brightness: 1.0
   gpu: 0
 
+# Geometry regime (CLIP-based): decimation_target and remesh per regime.
+# Regimes: simple, complex_big, complex_tiny. Pipeline picks regime from image then applies these overrides.
+geometry_regime:
+  simple:
+    decimation_target: 100000
+    remesh: true
+  complex_big:
+    decimation_target: 250000
+    remesh: true
+  complex_tiny:
+    decimation_target: 150000
+    remesh: true
+
 # Judge model settings
 judge:
-  enabled: false
+  enabled: true
   vllm_port: 8095
   vllm_model_name: "zai-org/GLM-4.1V-9B-Thinking"
   vllm_revision: "17193d2147da3acd0da358eb251ef862b47e7545"

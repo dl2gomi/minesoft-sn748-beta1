@@ -1,11 +1,27 @@
 # Object category config: CLIP prompts for classification and GLB material presets per category.
 # Edit this file to add/change categories or presets without changing code.
+#
+# Notes:
+# - Reconstructability (multiview) uses different prompts in clip_clarifier.py ("easy vs hard to recognize").
+#   Transparent or composite objects (e.g. window with frame) often get low scores because CLIP associates
+#   transparency/complexity with "hard to identify". You can lower reconstructability_threshold in
+#   configuration.yaml for less multiview, or add object-type-aware logic in code.
+# - Category only picks ONE label per image; for mixed-material objects, CLIP picks the dominant visual.
+#   Use the "mixed" category and neutral preset if you want a safe fallback for composites.
 
 categories:
   glass:
     - "a clear transparent glass bottle on a plain background"
+    - "a glass bottle or glass container made of glass"
     - "a glass jar or container made of transparent glass"
     - "a shiny glass cup or drinking glass"
+    - "a glass vase or glass bottle with glass material"
+    - "a window or glass pane with transparent or reflective glass"
+  clearPlastic:
+    - "a disposable clear plastic water bottle or soda bottle"
+    - "a transparent plastic container or packaging made of clear plastic"
+    - "a clear PET plastic bottle you can see through"
+    - "a single-use plastic drink bottle"
   metal:
     - "a polished shiny metal can on a plain background"
     - "a stainless steel tool or object made of metal"
@@ -19,33 +35,82 @@ categories:
     - "a soft toy or stuffed animal with fabric texture"
     - "a piece of fruit or food with organic surface"
     - "an object made of wood, fabric, or other organic material"
+  fabric:
+    - "a piece of cloth or fabric with soft material"
+    - "a winter coat or jacket made of fabric or padded material"
+    - "a garment or clothing item made of textile fabric"
+  wood:
+    - "a wooden furniture or wooden object"
+    - "a product made of wood with visible grain"
+  ceramic:
+    - "a ceramic vase or ceramic dish"
+    - "a porcelain or ceramic object with glossy or matte finish"
+  mixed:
+    - "an object made of multiple materials or mixed materials"
+    - "a product with different materials in different parts"
 
-# GLBConverterParams overrides per category (only material-related keys are typically used).
+# GLBConverterParams overrides per category.
+# alpha_mode: OPAQUE = no transparency; BLEND = allow transparency (e.g. glass).
 glb_presets:
   glass:
-    roughness_scale: 0.45
+    roughness_scale: 0.35
     roughness_bias: 0.05
     color_saturation: 0.9
     color_brightness: 1.0
-  metal:
-    roughness_scale: 0.5
-    roughness_bias: 0.08
+    alpha_mode: BLEND  # transparent glass should stay blended
+  clearPlastic:
+    roughness_scale: 0.45
+    roughness_bias: 0.1
     color_saturation: 0.9
     color_brightness: 1.0
+    alpha_mode: BLEND  # clear PET-style plastics can be see-through
+  metal:
+    roughness_scale: 0.55
+    roughness_bias: 0.10
+    color_saturation: 0.9
+    color_brightness: 0.98
+    alpha_mode: OPAQUE
   plastic:
-    roughness_scale: 0.7
-    roughness_bias: 0.1
-    color_saturation: 0.85
-    color_brightness: 1.0
+    roughness_scale: 0.75
+    roughness_bias: 0.12
+    color_saturation: 0.9
+    color_brightness: 0.98
+    alpha_mode: OPAQUE
   organic:
+    roughness_scale: 0.90
+    roughness_bias: 0.12
+    color_saturation: 0.95
+    color_brightness: 0.98
+    alpha_mode: OPAQUE
+  fabric:
+    roughness_scale: 0.92
+    roughness_bias: 0.15
+    color_saturation: 0.95
+    color_brightness: 0.96
+    alpha_mode: OPAQUE
+  wood:
     roughness_scale: 0.85
     roughness_bias: 0.12
     color_saturation: 0.9
-    color_brightness: 1.0
+    color_brightness: 0.97
+    alpha_mode: OPAQUE
+  ceramic:
+    roughness_scale: 0.60
+    roughness_bias: 0.07
+    color_saturation: 0.9
+    color_brightness: 0.98
+    alpha_mode: OPAQUE
+  mixed:
+    roughness_scale: 0.75
+    roughness_bias: 0.10
+    color_saturation: 0.9
+    color_brightness: 0.98
+    alpha_mode: OPAQUE
   generic:
-    roughness_scale: 0.7
-    roughness_bias: 0.1
-    color_saturation: 0.85
-    color_brightness: 1.0
+    roughness_scale: 0.75
+    roughness_bias: 0.10
+    color_saturation: 0.9
+    color_brightness: 0.98
+    alpha_mode: OPAQUE
 
-category_confidence_threshold: 0.45
+category_confidence_threshold: 0.5

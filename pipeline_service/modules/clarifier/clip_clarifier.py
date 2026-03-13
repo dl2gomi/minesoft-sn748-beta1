@@ -60,6 +60,14 @@ class CLIPClarifier:
             "a blurry, abstract, or confusing image where the subject is not identifiable",
         ]
 
+        # Geometry regime: abstract prompts (no object examples) for decimation/remesh choice.
+        self._geometry_regime_order = ["simple", "complex_big", "complex_tiny"]
+        self._geometry_regime_prompts = [
+            "a simple smooth object with few parts",
+            "a complex object with large solid connected parts",
+            "a complex object with many small thin or fine detailed parts",
+        ]
+
         # Coarse material/category labels: from caller (pipeline loads YAML) or load from YAML here (YAML is main source; loader fallback only if file missing).
         if category_prompts and category_order:
             self._category_prompts = dict(category_prompts)
@@ -201,14 +209,16 @@ class CLIPClarifier:
             explanation=explanation,
         )
 
-    def classify_category(self, image: Image.Image) -> Optional[str]:
+    def classify_category(self, image: Image.Image) -> tuple[Optional[str], Optional[float]]:
         """
         Classify the main object in the image into a coarse material category using CLIP.
-        Intended to be run after background removal. Returns one of: glass, metal, plastic, organic, generic.
-        Returns None if the clarifier is disabled or not loaded.
+        Intended to be run after background removal. Returns (category, confidence).
+        Category is one of: glass, metal, plastic, organic, generic.
+        Confidence is the softmax probability of the chosen/best category in [0, 1].
+        Returns (None, None) if the clarifier is disabled or not loaded.
         """
         if not self.settings.enabled or self._processor is None or self._model is None:
-            return None
+            return (None, None)
 
         self._ensure_ready()
         assert self._processor is not None
@@ -249,7 +259,7 @@ class CLIPClarifier:
 
         if not categories:
             logger.warning("Category classifier: no valid category prompts; returning generic.")
-            return "generic"
+            return ("generic", 0.0)
 
         scores_tensor = torch.tensor(scores, dtype=torch.float32, device=self.device)
         probs = torch.softmax(scores_tensor, dim=0)
@@ -268,5 +278,37 @@ class CLIPClarifier:
         logger.info(
             f"Category classifier: {chosen} (best={best_cat}, p={best_prob:.2f}, thr={threshold:.2f}) | probs={{{scores_str}}}"
         )
-        return chosen
+        return (chosen, best_prob)
+
+    def classify_geometry_regime(self, image: Image.Image) -> Optional[str]:
+        """
+        Classify the object's geometry regime from the image using CLIP (same model as category).
+        Returns one of: "simple", "complex_big", "complex_tiny". Returns None if clarifier disabled or not loaded.
+        Used to select per-regime decimation_target and remesh from config.
+        """
+        if not self.settings.enabled or self._processor is None or self._model is None:
+            return None
+
+        self._ensure_ready()
+        assert self._processor is not None
+        assert self._model is not None
+
+        inputs = self._processor(
+            text=self._geometry_regime_prompts,
+            images=image,
+            return_tensors="pt",
+            padding=True,
+        ).to(self.device)
+
+        with torch.no_grad():
+            outputs = self._model(**inputs)
+            logits_per_image = outputs.logits_per_image[0]  # (num_prompts,)
+
+        probs = torch.softmax(logits_per_image.float(), dim=0)
+        best_idx = int(torch.argmax(probs).item())
+        regime = self._geometry_regime_order[best_idx]
+        logger.info(
+            f"Geometry regime: {regime} | probs simple={probs[0].item():.2f}, complex_big={probs[1].item():.2f}, complex_tiny={probs[2].item():.2f}"
+        )
+        return regime
 

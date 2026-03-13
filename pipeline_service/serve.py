@@ -87,7 +87,7 @@ async def generate(prompt_image_file: UploadFile = File(...), seed: int = Form(-
     """
     Upload image file and generate 3D model as GLB buffer.
     Returns binary GLB file. Response headers include metadata for logging:
-    X-Generation-Time, X-Clarifier-Score, X-Multiview-Used, X-Clarifier-Explanation, X-Object-Category.
+    X-Generation-Time, X-Clarifier-Score, X-Multiview-Used, X-Clarifier-Explanation, X-Object-Category, X-Geometry-Regime.
     """
     try:
         logger.info(f"Task received. Uploading image: {prompt_image_file.filename}")
@@ -115,6 +115,10 @@ async def generate(prompt_image_file: UploadFile = File(...), seed: int = Form(-
             headers["X-Clarifier-Explanation"] = expl
         if result.object_category:
             headers["X-Object-Category"] = result.object_category
+        if result.object_category_confidence is not None:
+            headers["X-Object-Category-Score"] = f"{result.object_category_confidence:.4f}"
+        if result.geometry_regime:
+            headers["X-Geometry-Regime"] = result.geometry_regime
 
         logger.info(f"Task completed. GLB size: {buffer_size} bytes")
 

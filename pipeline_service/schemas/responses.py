@@ -14,6 +14,8 @@ class GenerationResponse(BaseModel):
     multiview_used: Optional[bool] = None
     clarifier_explanation: Optional[str] = None
     object_category: Optional[str] = None
+    object_category_confidence: Optional[float] = None
+    geometry_regime: Optional[str] = None  # simple | complex_big | complex_tiny (for decimation/remesh)
 
     class Config:
         json_schema_extra = {
@@ -27,5 +29,6 @@ class GenerationResponse(BaseModel):
                 "multiview_used": True,
                 "clarifier_explanation": "Unseen sides are hard to infer.",
                 "object_category": "plastic",
+                "object_category_confidence": 0.72,
             }
         }

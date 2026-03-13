@@ -77,6 +77,11 @@ class GenerationPipeline:
         category_order = list(category_prompts.keys())
         self._category_confidence_threshold: float = float(self._category_config.get("category_confidence_threshold", 0.45))
 
+        # Per-regime GLB overrides (decimation_target, remesh) from configuration
+        self._geometry_regime_presets: dict = (
+            settings.geometry_regime.model_dump() if settings.geometry_regime else {}
+        )
+
         # Initialize Judge module
         if settings.judge.enabled:
             self.judge_pipeline = VllmJudgePipeline(settings.judge)
@@ -261,12 +266,12 @@ class GenerationPipeline:
 
         return edited_images, clarifier_score, True, clarifier_explanation
 
-    async def generate_mesh(self, request: GenerationRequest) -> tuple[list[MeshWithVoxel], list[Image.Image], list[Image.Image], Optional[float], bool, Optional[str], Optional[str]]:
+    async def generate_mesh(self, request: GenerationRequest) -> tuple[list[MeshWithVoxel], list[Image.Image], list[Image.Image], Optional[float], bool, Optional[str], Optional[str], Optional[str]]:
         """
         Generate mesh from Trellis pipeline, along with processed images and clarifier metadata.
 
         Returns:
-            Tuple of (meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category)
+            Tuple of (meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category, object_category_confidence, geometry_regime)
         """
         # Set seed
         if request.seed < 0:
@@ -287,13 +292,24 @@ class GenerationPipeline:
 
         # 2b. Classify main object category (for GLB material presets); use first image after rembg
         object_category: Optional[str] = None
+        object_category_confidence: Optional[float] = None
         if self.settings.clarifier.enabled:
             try:
-                object_category = self.clarifier.classify_category(images_without_background[0])
+                object_category, object_category_confidence = self.clarifier.classify_category(images_without_background[0])
             except Exception as e:
                 logger.warning(f"Category classification failed: {e}; using default GLB params.")
         if object_category:
             logger.info(f"Object category for GLB preset: {object_category}")
+
+        # 2c. Classify geometry regime (simple / complex_big / complex_tiny) for decimation/remesh
+        geometry_regime: Optional[str] = None
+        if self.settings.clarifier.enabled:
+            try:
+                geometry_regime = self.clarifier.classify_geometry_regime(images_without_background[0])
+            except Exception as e:
+                logger.warning(f"Geometry regime classification failed: {e}; using default GLB geometry params.")
+        if geometry_regime:
+            logger.info(f"Geometry regime for GLB: {geometry_regime}")
 
         # Resolve Trellis parameters from request
         trellis_params: TrellisParams = request.trellis_params
@@ -317,9 +333,9 @@ class GenerationPipeline:
             ),
         )
 
-        return meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category
+        return meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category, object_category_confidence, geometry_regime
 
-    def convert_mesh_to_glb(self, mesh: MeshWithVoxel, glbconv_params: Optional[GLBConverterParams.Overrides], object_category: Optional[str] = None) -> bytes:
+    def convert_mesh_to_glb(self, mesh: MeshWithVoxel, glbconv_params: Optional[GLBConverterParams.Overrides], object_category: Optional[str] = None, geometry_regime: Optional[str] = None) -> bytes:
         """
         Convert mesh to GLB format using GLBConverter.
 
@@ -327,15 +343,17 @@ class GenerationPipeline:
             mesh: The mesh to convert
             glbconv_params: Optional override parameters for GLB conversion (from request)
             object_category: Optional category from classifier (glass, metal, etc.) to apply material preset
+            geometry_regime: Optional regime (simple / complex_big / complex_tiny) to apply decimation/remesh from config
 
         Returns:
             GLB file as bytes
         """
         start_time = time.time()
-        # Merge category-based preset with request overrides (category first, then request overrides win)
+        # Merge: category preset, then geometry regime preset (decimation_target, remesh), then request overrides
         category_overrides = get_glb_overrides_for_category(object_category, presets=self._category_glb_presets)
+        regime_overrides = self._geometry_regime_presets.get(geometry_regime or "", {})
         request_dict = (glbconv_params.model_dump(exclude_none=True) if glbconv_params else {})
-        merged = {**category_overrides, **request_dict}
+        merged = {**category_overrides, **regime_overrides, **request_dict}
         allowed_keys = set(GLBConverterParams.model_fields)
         params_filtered = GLBConverterParams.Overrides(**{k: v for k, v in merged.items() if k in allowed_keys}) if merged else glbconv_params
         glb_mesh = self.glb_converter.convert(mesh, params=params_filtered)
@@ -398,7 +416,7 @@ class GenerationPipeline:
         logger.info(f"Request received | Seed: {request.seed} | Prompt Type: {request.prompt_type.value}")
 
         # Generate mesh and get processed images
-        meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category = await self.generate_mesh(request)
+        meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category, object_category_confidence, geometry_regime = await self.generate_mesh(request)
 
         glb_trellis_result = None
         
@@ -408,7 +426,7 @@ class GenerationPipeline:
         glb_trellis_results = []
         if meshes:
             for mesh in meshes:
-                glb_bytes = self.convert_mesh_to_glb(mesh, request.glbconv_params, object_category)
+                glb_bytes = self.convert_mesh_to_glb(mesh, request.glbconv_params, object_category, geometry_regime)
                 glb_trellis_results.append(TrellisResult(file_bytes=glb_bytes))
 
         # Judge the meshes
@@ -444,6 +462,8 @@ class GenerationPipeline:
             multiview_used=multiview_used,
             clarifier_explanation=clarifier_explanation,
             object_category=object_category,
+            object_category_confidence=object_category_confidence,
+            geometry_regime=geometry_regime,
         )
         
         return response
