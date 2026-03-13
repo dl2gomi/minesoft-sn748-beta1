@@ -92,7 +92,7 @@ glb_converter:
   mesh_cluster_smooth_strength: 0.15
   mesh_cluster_threshold_cone_half_angle: 90
   smooth_mesh: true
-  smooth_iterations: 4
+  smooth_iterations: 5
   smooth_lambda: 0.5
   # Optional: make materials less rough (e.g. roughness_scale: 0.7, roughness_bias: 0.1)
   roughness_scale: 0.7
@@ -106,13 +106,13 @@ glb_converter:
 # Regimes: simple, complex_big, complex_tiny. Pipeline picks regime from image then applies these overrides.
 geometry_regime:
   simple:
-    decimation_target: 100000
+    decimation_target: 110000
     remesh: true
   complex_big:
-    decimation_target: 250000
+    decimation_target: 240000
     remesh: true
   complex_tiny:
-    decimation_target: 150000
+    decimation_target: 160000
     remesh: true
 
 # Judge model settings
