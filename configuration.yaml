@@ -96,7 +96,10 @@ glb_converter:
   # UV unwrap guards: above trivial_uv_max_* we skip CuMesh; after clustering, if chart count > max_xatlas_charts we skip xatlas (use planar UVs).
   trivial_uv_max_faces: 100000
   trivial_uv_max_vertices: 80000
-  max_xatlas_charts: 5000
+  max_xatlas_charts: 20000
+  # Hard mesh-size guard for GLB export; above these we skip GLB for that candidate altogether.
+  max_vertices_for_glb: 1000000
+  max_faces_for_glb: 2000000
   smooth_mesh: true
   smooth_iterations: 5
   smooth_lambda: 0.5

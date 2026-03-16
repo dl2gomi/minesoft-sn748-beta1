@@ -32,7 +32,7 @@ from modules.background_removal.enums import RMBGModelType
 from modules.grid_renderer.render import GridViewRenderer
 from modules.mesh_generator.mesh_generator_module import MeshGeneratorModule
 from modules.mesh_generator.trellis_pipeline import Trellis2MeshPipeline
-from modules.converters.glb_converter import GLBConverter
+from modules.converters.glb_converter import GLBConverter, MeshTooLargeForGLB
 from modules.judge.duel_manager import DuelManager
 from modules.judge.vllm_judge_pipeline import VllmJudgePipeline
 from libs.trellis2.representations.mesh.base import MeshWithVoxel
@@ -322,15 +322,37 @@ class GenerationPipeline:
         #     img.save(path)
         # logger.info(f"Temporary debug: saved {len(images_without_background)} Trellis input images to {save_dir} as {stem}_trellis_*.png")
 
-        # 3. Generate the 3D model
-        meshes = self.mesh_generator.generate(
-            model=self.mesh_pipeline,
-            request=TrellisRequest(
-                image=images_without_background,
-                seed=request.seed,
-                params=trellis_params
-            ),
-        )
+        # 3. Generate the 3D model (with a guarded retry on Trellis OOM)
+        try:
+            meshes = self.mesh_generator.generate(
+                model=self.mesh_pipeline,
+                request=TrellisRequest(
+                    image=images_without_background,
+                    seed=request.seed,
+                    params=trellis_params
+                ),
+            )
+        except (torch.cuda.OutOfMemoryError, torch.AcceleratorError, RuntimeError) as e:
+            msg = str(e).lower()
+            if "out of memory" not in msg and "cuda" not in msg and "acceleratorerror" not in msg:
+                raise
+            logger.warning(f"Trellis OOM during mesh generation; retrying once with lighter settings: {e}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # Retry once with a lighter Trellis configuration (pipeline_type=512, num_samples=1).
+            fallback_overrides = TrellisParams.Overrides(
+                pipeline_type=TrellisPipeType.MODE_512,
+                num_samples=1,
+            )
+            self._last_trellis_pipeline_type = TrellisPipeType.MODE_512.value
+            meshes = self.mesh_generator.generate(
+                model=self.mesh_pipeline,
+                request=TrellisRequest(
+                    image=images_without_background,
+                    seed=request.seed,
+                    params=fallback_overrides,
+                ),
+            )
 
         return meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category, object_category_confidence
 
@@ -531,7 +553,11 @@ class GenerationPipeline:
         glb_sizes: list[int] = []
         if meshes:
             for mesh in meshes:
-                glb_bytes = self.convert_mesh_to_glb(mesh, request.glbconv_params, object_category)
+                try:
+                    glb_bytes = self.convert_mesh_to_glb(mesh, request.glbconv_params, object_category)
+                except MeshTooLargeForGLB as e:
+                    logger.warning(f"Skipping GLB candidate due to oversized mesh: {e}")
+                    continue
                 uv_infos.append(getattr(self.glb_converter, "last_uv_unwrap_info", None))
                 glb_trellis_results.append(TrellisResult(file_bytes=glb_bytes))
                 glb_sizes.append(len(glb_bytes) if isinstance(glb_bytes, (bytes, bytearray)) else 0)
@@ -540,6 +566,9 @@ class GenerationPipeline:
         winner_index: int = 0
         max_bytes = getattr(self.settings.judge, "max_glb_bytes_for_judge", 0) or 0
         too_large_indices = {i for i, sz in enumerate(glb_sizes) if max_bytes > 0 and sz > max_bytes}
+
+        if not glb_trellis_results:
+            raise RuntimeError("No GLB candidates were produced from Trellis meshes.")
 
         if glb_trellis_results:
             if too_large_indices:

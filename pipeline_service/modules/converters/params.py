@@ -23,6 +23,9 @@ class GLBConverterParams(OverridableModel):
     trivial_uv_max_faces: int = 100_000
     trivial_uv_max_vertices: int = 80_000
     max_xatlas_charts: int = 5000
+    # Hard mesh-size guard for GLB export; above these we skip GLB for that candidate.
+    max_vertices_for_glb: int = 10_000_000
+    max_faces_for_glb: int = 20_000_000
     subdivisions: int = 2
     vertex_reproject: float = 0.0
     alpha_gamma: float = 2.2

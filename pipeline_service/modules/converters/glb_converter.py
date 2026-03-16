@@ -51,6 +51,11 @@ def _trivial_uvs_and_normals_gpu(vertices: torch.Tensor, faces: torch.Tensor, de
     return MeshData(vertices=vertices, faces=faces, vertex_normals=vertex_normals, uvs=uvs)
 
 
+class MeshTooLargeForGLB(Exception):
+    """Raised when a mesh is too large to safely convert to GLB."""
+    pass
+
+
 class GLBConverter:
     """Converter for extracting and texturing meshes to GLB format."""
     DEFAULT_AABB = torch.as_tensor([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], dtype=torch.float32)
@@ -72,6 +77,23 @@ class GLBConverter:
         params = self.default_params.overrided(params)
         logger.debug(f"Using GLB conversion parameters: {params}")
         self.last_uv_unwrap_info = None
+
+         # Hard guard: if the mesh is extremely large, skip GLB generation for this candidate.
+        num_vertices = int(mesh.vertices.shape[0])
+        num_faces = int(mesh.faces.shape[0])
+        if num_vertices > params.max_vertices_for_glb or num_faces > params.max_faces_for_glb:
+            logger.warning(
+                "Skipping GLB conversion for oversized mesh: vertices=%d faces=%d "
+                "(limits: %d verts, %d faces)",
+                num_vertices,
+                num_faces,
+                params.max_vertices_for_glb,
+                params.max_faces_for_glb,
+            )
+            raise MeshTooLargeForGLB(
+                f"Mesh too large for GLB (vertices={num_vertices}, faces={num_faces}, "
+                f"limits={params.max_vertices_for_glb}/{params.max_faces_for_glb})"
+            )
 
         # 1. Prepare original mesh data with BVH
         original_mesh_data = self._prepare_original_mesh(mesh, aabb)

@@ -280,8 +280,8 @@ class CLIPClarifier:
 
     def suggest_pipeline_type(self, image: Image.Image) -> Optional[str]:
         """
-        Suggest Trellis pipeline_type from the image using CLIP: '512' (simple) or '1024_cascade' (complex).
-        Uses rembg'd image to predict whether the object is simple (→ 512, lighter) or complex (→ 1024_cascade).
+        Suggest Trellis pipeline_type from the image using CLIP.
+        Default is 512; we only upgrade to 1024_cascade for *very* simple objects.
         Returns None if clarifier is disabled or suggest_pipeline_type is False.
         """
         if not getattr(self.settings, "suggest_pipeline_type", True) or not self.settings.enabled:
@@ -304,11 +304,19 @@ class CLIPClarifier:
             logits_per_image = outputs.logits_per_image[0]
 
         probs = torch.softmax(logits_per_image.float(), dim=0)
-        best_idx = int(torch.argmax(probs).item())
-        # 0 = simple → 1024_cascade (safe), 1 = complex → 512 (avoid OOM)
-        suggested = "1024_cascade" if best_idx == 0 else "512"
+        simple_prob = float(probs[0].item())
+        complex_prob = float(probs[1].item())
+
+        # Very strict gate: 1024_cascade only when the object is clearly "simple".
+        # Otherwise we stay in 512 mode to reduce OOM risk.
+        use_1024 = simple_prob >= 0.90 and (simple_prob - complex_prob) >= 0.30
+        suggested = "1024_cascade" if use_1024 else "512"
+
         logger.info(
-            f"Pipeline type suggestion: {suggested} | probs simple={probs[0].item():.2f}, complex={probs[1].item():.2f}"
+            "Pipeline type suggestion: %s | probs simple=%.2f, complex=%.2f",
+            suggested,
+            simple_prob,
+            complex_prob,
         )
         return suggested
 
