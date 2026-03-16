@@ -117,8 +117,16 @@ async def generate(prompt_image_file: UploadFile = File(...), seed: int = Form(-
             headers["X-Object-Category"] = result.object_category
         if result.object_category_confidence is not None:
             headers["X-Object-Category-Score"] = f"{result.object_category_confidence:.4f}"
-        if result.geometry_regime:
-            headers["X-Geometry-Regime"] = result.geometry_regime
+        if getattr(result, "trellis_pipeline_type", None):
+            headers["X-Trellis-Pipeline-Type"] = str(result.trellis_pipeline_type)
+        if getattr(result, "suggested_pipeline_type", None):
+            headers["X-Trellis-Pipeline-Type-Suggested"] = str(result.suggested_pipeline_type)
+        if getattr(result, "uv_unwrap_mode", None):
+            headers["X-UV-Unwrap-Mode"] = str(result.uv_unwrap_mode)
+        if getattr(result, "uv_unwrap_reason", None):
+            headers["X-UV-Unwrap-Reason"] = str(result.uv_unwrap_reason)
+        if getattr(result, "uv_num_charts", None) is not None:
+            headers["X-UV-Num-Charts"] = str(result.uv_num_charts)
 
         logger.info(f"Task completed. GLB size: {buffer_size} bytes")
 

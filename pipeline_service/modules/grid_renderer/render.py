@@ -6,6 +6,7 @@ import io
 from loguru import logger
 import numpy as np
 from PIL import Image
+from PIL import PngImagePlugin
 from OpenGL.GL import GL_LINEAR
 import pyrender
 import trimesh
@@ -101,7 +102,11 @@ class GridViewRenderer():
             logger.debug(f"All {view_count} views rendered with {ssaa_factor}x SSAA, combining into grid")
             grid = img_utils.combine4(images)
             buffer = io.BytesIO()
-            grid.save(buffer, format="PNG")
+            # Add sRGB chunk so Windows Explorer / Photo Viewer display the PNG correctly
+            # (without it some Windows viewers show the file as corrupted)
+            pnginfo = PngImagePlugin.PngInfo()
+            pnginfo.add(b"sRGB", b"\x00")  # rendering intent 0 = Perceptual
+            grid.save(buffer, format="PNG", pnginfo=pnginfo, optimize=False)
             buffer.seek(0)
             png_bytes = buffer.read()
             logger.info(f"GLB rendering complete, output size: {len(png_bytes)} bytes | Generation time: {time.time() - start_time:.2f}s")

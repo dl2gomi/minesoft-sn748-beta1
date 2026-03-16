@@ -41,19 +41,6 @@ class ModelVersionsConfig(BaseModel):
         return self.models.get(model_id)
 
 
-class GeometryRegimePreset(BaseModel):
-    """Decimation and remesh overrides for a geometry regime (simple / complex_big / complex_tiny)."""
-    decimation_target: int
-    remesh: bool
-
-
-class GeometryRegimeConfig(BaseModel):
-    """Per-regime GLB geometry overrides (used after CLIP geometry-regime classification)."""
-    simple: GeometryRegimePreset
-    complex_big: GeometryRegimePreset
-    complex_tiny: GeometryRegimePreset
-
-
 class SettingsConf(BaseSettings):
     """Main settings class"""
     api: APIConfig = APIConfig()
@@ -62,7 +49,6 @@ class SettingsConf(BaseSettings):
     qwen: QwenConfig
     background_removal: BackgroundRemovalConfig
     glb_converter: GLBConverterConfig
-    geometry_regime: Optional[GeometryRegimeConfig] = None
     model_versions: ModelVersionsConfig        
     judge: JudgeConfig
     clarifier: ClarifierConfig

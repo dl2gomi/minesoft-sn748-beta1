@@ -21,6 +21,7 @@ from logger_config import logger
 from schemas.requests import GenerationRequest
 from schemas.responses import GenerationResponse
 from modules.mesh_generator.schemas import TrellisParams, TrellisRequest, TrellisResult
+from modules.mesh_generator.enums import TrellisPipeType
 from modules.image_edit.edit_module import EditModule
 from modules.image_edit.qwen_edit_pipeline import QwenEditPipeline
 from modules.image_edit.schemas import ImageGenerationParams
@@ -76,11 +77,6 @@ class GenerationPipeline:
         category_prompts = self._category_config["categories"]
         category_order = list(category_prompts.keys())
         self._category_confidence_threshold: float = float(self._category_config.get("category_confidence_threshold", 0.45))
-
-        # Per-regime GLB overrides (decimation_target, remesh) from configuration
-        self._geometry_regime_presets: dict = (
-            settings.geometry_regime.model_dump() if settings.geometry_regime else {}
-        )
 
         # Initialize Judge module
         if settings.judge.enabled:
@@ -266,12 +262,12 @@ class GenerationPipeline:
 
         return edited_images, clarifier_score, True, clarifier_explanation
 
-    async def generate_mesh(self, request: GenerationRequest) -> tuple[list[MeshWithVoxel], list[Image.Image], list[Image.Image], Optional[float], bool, Optional[str], Optional[str], Optional[str]]:
+    async def generate_mesh(self, request: GenerationRequest) -> tuple[list[MeshWithVoxel], list[Image.Image], list[Image.Image], Optional[float], bool, Optional[str], Optional[str], Optional[float]]:
         """
         Generate mesh from Trellis pipeline, along with processed images and clarifier metadata.
 
         Returns:
-            Tuple of (meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category, object_category_confidence, geometry_regime)
+            Tuple of (meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category, object_category_confidence)
         """
         # Set seed
         if request.seed < 0:
@@ -301,18 +297,21 @@ class GenerationPipeline:
         if object_category:
             logger.info(f"Object category for GLB preset: {object_category}")
 
-        # 2c. Classify geometry regime (simple / complex_big / complex_tiny) for decimation/remesh
-        geometry_regime: Optional[str] = None
-        if self.settings.clarifier.enabled:
-            try:
-                geometry_regime = self.clarifier.classify_geometry_regime(images_without_background[0])
-            except Exception as e:
-                logger.warning(f"Geometry regime classification failed: {e}; using default GLB geometry params.")
-        if geometry_regime:
-            logger.info(f"Geometry regime for GLB: {geometry_regime}")
+        # Optional: predict pipeline_type (512 vs 1024_cascade) from rembg'd image before Trellis
+        overrides_dict = request.trellis_params.model_dump(exclude_none=True) if request.trellis_params else {}
+        suggested_pipeline = self.clarifier.suggest_pipeline_type(images_without_background[0]) if getattr(self.settings.clarifier, "suggest_pipeline_type", True) else None
+        if suggested_pipeline is not None:
+            overrides_dict["pipeline_type"] = TrellisPipeType.MODE_512 if suggested_pipeline == "512" else TrellisPipeType.MODE_1024_CASCADE
+        trellis_params = TrellisParams.Overrides(**overrides_dict) if overrides_dict else request.trellis_params
 
-        # Resolve Trellis parameters from request
-        trellis_params: TrellisParams = request.trellis_params
+        # Store the final Trellis pipeline_type that will actually be used.
+        try:
+            effective_params = self.mesh_generator.default_params.overrided(trellis_params) if trellis_params else self.mesh_generator.default_params
+            self._last_trellis_pipeline_type = getattr(effective_params.pipeline_type, "value", str(effective_params.pipeline_type))
+            self._last_trellis_pipeline_type_suggested = suggested_pipeline
+        except Exception:
+            self._last_trellis_pipeline_type = None
+            self._last_trellis_pipeline_type_suggested = suggested_pipeline
 
         # Temporary debug: save the image list fed to Trellis to files (named after input image)
         # stem = Path(request.input_filename).stem if request.input_filename else datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -333,9 +332,9 @@ class GenerationPipeline:
             ),
         )
 
-        return meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category, object_category_confidence, geometry_regime
+        return meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category, object_category_confidence
 
-    def convert_mesh_to_glb(self, mesh: MeshWithVoxel, glbconv_params: Optional[GLBConverterParams.Overrides], object_category: Optional[str] = None, geometry_regime: Optional[str] = None) -> bytes:
+    def convert_mesh_to_glb(self, mesh: MeshWithVoxel, glbconv_params: Optional[GLBConverterParams.Overrides], object_category: Optional[str] = None) -> bytes:
         """
         Convert mesh to GLB format using GLBConverter.
 
@@ -343,20 +342,124 @@ class GenerationPipeline:
             mesh: The mesh to convert
             glbconv_params: Optional override parameters for GLB conversion (from request)
             object_category: Optional category from classifier (glass, metal, etc.) to apply material preset
-            geometry_regime: Optional regime (simple / complex_big / complex_tiny) to apply decimation/remesh from config
 
         Returns:
             GLB file as bytes
         """
         start_time = time.time()
-        # Merge: category preset, then geometry regime preset (decimation_target, remesh), then request overrides
+        # Merge: base config, then category preset, then request overrides
         category_overrides = get_glb_overrides_for_category(object_category, presets=self._category_glb_presets)
-        regime_overrides = self._geometry_regime_presets.get(geometry_regime or "", {})
-        request_dict = (glbconv_params.model_dump(exclude_none=True) if glbconv_params else {})
-        merged = {**category_overrides, **regime_overrides, **request_dict}
+        request_dict = glbconv_params.model_dump(exclude_none=True) if glbconv_params else {}
+
+        # Start from global GLB defaults in settings, then layer in presets/overrides.
+        base_defaults = GLBConverterParams.from_settings(self.settings.glb_converter)
+        merged = {**base_defaults.model_dump(), **category_overrides, **request_dict}
         allowed_keys = set(GLBConverterParams.model_fields)
-        params_filtered = GLBConverterParams.Overrides(**{k: v for k, v in merged.items() if k in allowed_keys}) if merged else glbconv_params
-        glb_mesh = self.glb_converter.convert(mesh, params=params_filtered)
+        merged = {k: v for k, v in merged.items() if k in allowed_keys}
+
+        # Heuristic: derive GLB params from actual mesh size and current VRAM,
+        # based on mesh size and VRAM.
+        num_vertices = int(mesh.vertices.shape[0])
+        num_faces = int(mesh.faces.shape[0])
+
+        free_mem_gb = None
+        if torch.cuda.is_available():
+            try:
+                # mem_get_info: (free, total) in bytes
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                free_mem_gb = free_bytes / (1024 ** 3)
+            except Exception:
+                free_mem_gb = None
+
+        # Baseline targets from settings (already in merged), but we may clamp them.
+        dec_target = int(merged.get("decimation_target", base_defaults.decimation_target))
+        tex_size = int(merged.get("texture_size", base_defaults.texture_size))
+        remesh = bool(merged.get("remesh", base_defaults.remesh))
+        subdivisions = int(merged.get("subdivisions", base_defaults.subdivisions))
+
+        # Mesh size tiers
+        very_large = num_vertices > 1_000_000 or num_faces > 2_000_000
+        large = num_vertices > 400_000 or num_faces > 800_000
+
+        low_vram = free_mem_gb is not None and free_mem_gb < 10.0
+        very_low_vram = free_mem_gb is not None and free_mem_gb < 6.0
+
+        # Clamp based purely on mesh size + VRAM.
+        if very_large or very_low_vram:
+            # Heaviest meshes or very low free memory: no remesh, aggressive decimation, no subdivisions.
+            remesh = False
+            dec_target = min(dec_target, 60_000)
+            tex_size = min(tex_size, 1024)
+            subdivisions = 0
+        elif large or low_vram:
+            # Moderately heavy meshes: lighter but still decent quality.
+            remesh = remesh and not low_vram  # disable remesh if VRAM is already low
+            dec_target = min(dec_target, 100_000)
+            tex_size = min(tex_size, 1536)
+            subdivisions = min(subdivisions, 1)
+
+        merged["decimation_target"] = int(dec_target)
+        merged["texture_size"] = int(tex_size)
+        merged["remesh"] = bool(remesh)
+        merged["subdivisions"] = int(subdivisions)
+
+        params_filtered = GLBConverterParams.Overrides(**merged)
+
+        def _is_cuda_oom(exc: BaseException) -> bool:
+            msg = str(exc).lower()
+            return "out of memory" in msg or "cuda" in msg or "cumesh" in msg
+
+        # First attempt: use the merged parameters as-is.
+        try:
+            glb_mesh = self.glb_converter.convert(mesh, params=params_filtered)
+        except (RuntimeError, torch.cuda.OutOfMemoryError, torch.AcceleratorError) as e:
+            if not _is_cuda_oom(e):
+                raise
+
+            logger.warning(
+                "GLB conversion OOM on first attempt (category=%s); "
+                "retrying with lighter params based on mesh size/VRAM: %s",
+                object_category,
+                e,
+            )
+            # Build a lighter override that keeps work on GPU but reduces memory pressure.
+            base = params_filtered or GLBConverterParams.Overrides()
+            lighter = GLBConverterParams.Overrides(
+                decimation_target=min(
+                    getattr(base, "decimation_target", 120_000) or 120_000,
+                    70_000,
+                ),
+                texture_size=min(
+                    getattr(base, "texture_size", 2048) or 2048,
+                    1024,
+                ),
+                remesh=False,
+                subdivisions=0,
+                vertex_reproject=0.0,
+                smooth_mesh=False,
+                alpha_mode=getattr(base, "alpha_mode", GLBConverterParams().alpha_mode),
+                rescale=getattr(base, "rescale", 1.0),
+                remesh_band=getattr(base, "remesh_band", 1.0),
+                remesh_project=getattr(base, "remesh_project", 0.0),
+                mesh_cluster_refine_iterations=getattr(base, "mesh_cluster_refine_iterations", 0),
+                mesh_cluster_global_iterations=getattr(base, "mesh_cluster_global_iterations", 1),
+                mesh_cluster_smooth_strength=getattr(base, "mesh_cluster_smooth_strength", 1.0),
+                mesh_cluster_threshold_cone_half_angle=getattr(
+                    base, "mesh_cluster_threshold_cone_half_angle", 90.0
+                ),
+                alpha_gamma=getattr(base, "alpha_gamma", 2.2),
+                smooth_iterations=getattr(base, "smooth_iterations", 5),
+                smooth_lambda=getattr(base, "smooth_lambda", 0.5),
+                roughness_scale=getattr(base, "roughness_scale", 1.0),
+                roughness_bias=getattr(base, "roughness_bias", 0.0),
+                color_saturation=getattr(base, "color_saturation", 1.0),
+                color_brightness=getattr(base, "color_brightness", 1.0),
+            )
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            glb_mesh = self.glb_converter.convert(mesh, params=lighter)
 
         buffer = io.BytesIO()
         glb_mesh.export(file_obj=buffer, file_type="glb", extension_webp=False)
@@ -416,25 +519,51 @@ class GenerationPipeline:
         logger.info(f"Request received | Seed: {request.seed} | Prompt Type: {request.prompt_type.value}")
 
         # Generate mesh and get processed images
-        meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category, object_category_confidence, geometry_regime = await self.generate_mesh(request)
+        meshes, images_edited, images_without_background, clarifier_score, multiview_used, clarifier_explanation, object_category, object_category_confidence = await self.generate_mesh(request)
 
         glb_trellis_result = None
         
         self._clean_gpu_memory()
 
         # Convert meshes to GLB
-        glb_trellis_results = []
+        glb_trellis_results: list[TrellisResult] = []
+        uv_infos: list[dict | None] = []
+        glb_sizes: list[int] = []
         if meshes:
             for mesh in meshes:
-                glb_bytes = self.convert_mesh_to_glb(mesh, request.glbconv_params, object_category, geometry_regime)
+                glb_bytes = self.convert_mesh_to_glb(mesh, request.glbconv_params, object_category)
+                uv_infos.append(getattr(self.glb_converter, "last_uv_unwrap_info", None))
                 glb_trellis_results.append(TrellisResult(file_bytes=glb_bytes))
+                glb_sizes.append(len(glb_bytes) if isinstance(glb_bytes, (bytes, bytearray)) else 0)
 
-        # Judge the meshes
-        if self.duel_manager and self.judge_pipeline:
-            mesh_winner_index = await self.duel_manager.judge_meshes(self.judge_pipeline, glb_trellis_results, request.prompt_image, request.seed)
-            glb_trellis_result = glb_trellis_results[mesh_winner_index]
-        else:
-            glb_trellis_result = glb_trellis_results[0]
+        # Decide whether to run the judge based on GLB sizes
+        winner_index: int = 0
+        max_bytes = getattr(self.settings.judge, "max_glb_bytes_for_judge", 0) or 0
+        too_large_indices = {i for i, sz in enumerate(glb_sizes) if max_bytes > 0 and sz > max_bytes}
+
+        if glb_trellis_results:
+            if too_large_indices:
+                # At least one candidate is too large: skip judge entirely and ignore those candidates.
+                logger.info(
+                    "Skipping judge due to large GLB(s): indices=%s, sizes=%s, threshold=%d bytes",
+                    sorted(too_large_indices),
+                    [glb_sizes[i] for i in sorted(too_large_indices)],
+                    max_bytes,
+                )
+                # Pick the smallest remaining candidate by size (or overall smallest if all are too large).
+                candidate_indices = [i for i in range(len(glb_trellis_results)) if i not in too_large_indices]
+                if not candidate_indices:
+                    candidate_indices = list(range(len(glb_trellis_results)))
+                winner_index = min(candidate_indices, key=lambda i: glb_sizes[i] if glb_sizes[i] else float("inf"))
+                glb_trellis_result = glb_trellis_results[winner_index]
+            elif self.duel_manager and self.judge_pipeline:
+                # All candidates within size budget: run judge as usual.
+                winner_index = await self.duel_manager.judge_meshes(
+                    self.judge_pipeline, glb_trellis_results, request.prompt_image, request.seed
+                )
+                glb_trellis_result = glb_trellis_results[winner_index]
+            else:
+                glb_trellis_result = glb_trellis_results[0]
 
         # Save generated files
         image_edited_base64, image_no_bg_base64 = None, None
@@ -450,10 +579,13 @@ class GenerationPipeline:
 
         logger.success(f"Generation time: {generation_time:.2f}s")
 
+        # Pick UV info for the winner (if any)
+        winner_uv = uv_infos[winner_index] if (uv_infos and 0 <= winner_index < len(uv_infos)) else None
+
         # Clean the GPU memory
         self._clean_gpu_memory()
 
-        response = GenerationResponse(
+        return GenerationResponse(
             generation_time=generation_time,
             glb_file_base64=glb_trellis_result.file_bytes if glb_trellis_result else None,
             image_edited_file_base64=image_edited_base64,
@@ -463,7 +595,9 @@ class GenerationPipeline:
             clarifier_explanation=clarifier_explanation,
             object_category=object_category,
             object_category_confidence=object_category_confidence,
-            geometry_regime=geometry_regime,
+            trellis_pipeline_type=getattr(self, "_last_trellis_pipeline_type", None),
+            suggested_pipeline_type=getattr(self, "_last_trellis_pipeline_type_suggested", None),
+            uv_unwrap_mode=(winner_uv or {}).get("mode") if isinstance(winner_uv, dict) else None,
+            uv_unwrap_reason=(winner_uv or {}).get("reason") if isinstance(winner_uv, dict) else None,
+            uv_num_charts=(winner_uv or {}).get("num_charts") if isinstance(winner_uv, dict) else None,
         )
-        
-        return response

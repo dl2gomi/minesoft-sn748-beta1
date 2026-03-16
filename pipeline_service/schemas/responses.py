@@ -15,7 +15,12 @@ class GenerationResponse(BaseModel):
     clarifier_explanation: Optional[str] = None
     object_category: Optional[str] = None
     object_category_confidence: Optional[float] = None
-    geometry_regime: Optional[str] = None  # simple | complex_big | complex_tiny (for decimation/remesh)
+    # Extra debugging / logging metadata
+    trellis_pipeline_type: Optional[str] = None
+    suggested_pipeline_type: Optional[str] = None
+    uv_unwrap_mode: Optional[str] = None
+    uv_unwrap_reason: Optional[str] = None
+    uv_num_charts: Optional[int] = None
 
     class Config:
         json_schema_extra = {

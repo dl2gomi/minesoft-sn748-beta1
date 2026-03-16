@@ -12,3 +12,6 @@ class JudgeConfig(BaseModel):
     gpu_memory_utilization: float = 0.20
     max_model_len: int = 8096
     max_num_seqs: int = 2
+    # If any GLB candidate exceeds this many bytes, we skip the judge step
+    # and ignore that candidate. 0 or negative disables this guard.
+    max_glb_bytes_for_judge: int = 0

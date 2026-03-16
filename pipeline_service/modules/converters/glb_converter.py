@@ -26,6 +26,31 @@ DITHER_PATTERN_SIZE = 16
 DITHER_PATTERN = bayer_dither_pattern(4096, 4096, DITHER_PATTERN_SIZE)
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """Return True if the exception looks like a CUDA/CuMesh OOM."""
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda" in msg or "cumesh" in msg
+
+
+def _trivial_uvs_and_normals_gpu(vertices: torch.Tensor, faces: torch.Tensor, device: torch.device) -> MeshData:
+    """Build MeshData with trivial planar UVs and vertex normals on GPU (no CuMesh/xatlas)."""
+    vertices = vertices.to(device)
+    faces = faces.long().to(device)
+    uv_xy = vertices[:, :2]
+    lo, hi = uv_xy.min().item(), uv_xy.max().item()
+    span = max(hi - lo, 1e-8)
+    uvs = ((uv_xy - lo) / span).to(vertices.dtype)
+    v0, v1, v2 = vertices[faces[:, 0]], vertices[faces[:, 1]], vertices[faces[:, 2]]
+    e1, e2 = v1 - v0, v2 - v0
+    fn = F.normalize(torch.linalg.cross(e1, e2, dim=-1), dim=-1)
+    vertex_normals = torch.zeros_like(vertices)
+    vertex_normals.index_add_(0, faces[:, 0], fn)
+    vertex_normals.index_add_(0, faces[:, 1], fn)
+    vertex_normals.index_add_(0, faces[:, 2], fn)
+    vertex_normals = F.normalize(vertex_normals, dim=-1)
+    return MeshData(vertices=vertices, faces=faces, vertex_normals=vertex_normals, uvs=uvs)
+
+
 class GLBConverter:
     """Converter for extracting and texturing meshes to GLB format."""
     DEFAULT_AABB = torch.as_tensor([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], dtype=torch.float32)
@@ -36,6 +61,9 @@ class GLBConverter:
         self.default_params = GLBConverterParams.from_settings(settings)
         self.logger = logger
         self.device = torch.device(f'cuda:{settings.gpu}' if torch.cuda.is_available() else 'cpu')
+        # Populated during convert() for the most recent mesh.
+        # Shape: {"mode": "xatlas"|"trivial", "reason": str|None, "num_charts": int|None}
+        self.last_uv_unwrap_info: dict | None = None
     
     def convert(self, mesh: MeshWithVoxel, aabb: torch.Tensor = DEFAULT_AABB, params: GLBConverterParams = None) -> trimesh.Trimesh:
         """Convert the given mesh to a textured GLB format."""
@@ -43,6 +71,7 @@ class GLBConverter:
         
         params = self.default_params.overrided(params)
         logger.debug(f"Using GLB conversion parameters: {params}")
+        self.last_uv_unwrap_info = None
 
         # 1. Prepare original mesh data with BVH
         original_mesh_data = self._prepare_original_mesh(mesh, aabb)
@@ -90,20 +119,26 @@ class GLBConverter:
 
         vertices = mesh.vertices.to(self.device)
         faces = mesh.faces.to(self.device)
-        
-        cumesh_mesh = cumesh.CuMesh()
-        cumesh_mesh.init(vertices, faces)
-        cumesh_mesh.fill_holes(max_hole_perimeter=3e-2)
-        logger.debug(f"After filling holes: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
 
         vertex_normals = None
-        vertices, faces = cumesh_mesh.read()
+        try:
+            cumesh_mesh = cumesh.CuMesh()
+            cumesh_mesh.init(vertices, faces)
+            cumesh_mesh.fill_holes(max_hole_perimeter=3e-2)
+            logger.debug(f"After filling holes: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
+            vertices, faces = cumesh_mesh.read()
+            if compute_vertex_normals:
+                cumesh_mesh.compute_vertex_normals()
+                vertex_normals = cumesh_mesh.read_vertex_normals()
+        except RuntimeError as e:
+            if _is_cuda_oom(e):
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                logger.warning(f"CuMesh OOM in _prepare_original_mesh, skipping fill_holes: {e}")
+            else:
+                raise
 
-        if compute_vertex_normals:
-            cumesh_mesh.compute_vertex_normals()
-            vertex_normals = cumesh_mesh.read_vertex_normals()
-
-        original_mesh_data = MeshDataWithAttributeGrid(vertices=vertices, faces=faces,vertex_normals=vertex_normals, attrs=attrs)
+        original_mesh_data = MeshDataWithAttributeGrid(vertices=vertices, faces=faces, vertex_normals=vertex_normals, attrs=attrs)
         
         # Build BVH for the current mesh to guide remeshing
         logger.debug(f"Building BVH for current mesh...")
@@ -114,122 +149,135 @@ class GLBConverter:
 
     def _cleanup_mesh(self, original_mesh_data: MeshDataWithAttributeGrid, params: GLBConverterParams) -> MeshData:
         """Cleanup and optimize the mesh using decimation and remeshing."""
-        # Create cumesh from current mesh data
-        cumesh_mesh = cumesh.CuMesh()
-        cumesh_mesh.init(original_mesh_data.vertices, original_mesh_data.faces)
+        try:
+            cumesh_mesh = cumesh.CuMesh()
+            cumesh_mesh.init(original_mesh_data.vertices, original_mesh_data.faces)
 
-        if params.smooth_mesh:
-            logger.debug(f"Applying Taubin smoothing: iterations={params.smooth_iterations}, lambda={params.smooth_lambda}")
-            smoothed_vertices = taubin_smooth(
-                original_mesh_data,
-                iterations=params.smooth_iterations,
-                lambda_factor=params.smooth_lambda,
-                mu_factor=-(params.smooth_lambda + 0.01),
-            )
-            cumesh_mesh.init(smoothed_vertices, original_mesh_data.faces)
+            if params.smooth_mesh:
+                logger.debug(f"Applying Taubin smoothing: iterations={params.smooth_iterations}, lambda={params.smooth_lambda}")
+                smoothed_vertices = taubin_smooth(
+                    original_mesh_data,
+                    iterations=params.smooth_iterations,
+                    lambda_factor=params.smooth_lambda,
+                    mu_factor=-(params.smooth_lambda + 0.01),
+                )
+                cumesh_mesh.init(smoothed_vertices, original_mesh_data.faces)
 
-        # Step 1: Aggressive simplification (3x target)
-        cumesh_mesh.simplify(params.decimation_target * 3, verbose=False)
-        logger.debug(f"After initial simplification: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
-        
-        # Step 2: Clean up topology (duplicates, non-manifolds, isolated parts)
-        cumesh_mesh.remove_duplicate_faces()
-        cumesh_mesh.repair_non_manifold_edges()
-        cumesh_mesh.remove_small_connected_components(1e-5)
-        cumesh_mesh.fill_holes(max_hole_perimeter=3e-2)
-        logger.debug(f"After initial cleanup: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
-            
-        # Step 3: Final simplification to target count
-        cumesh_mesh.simplify(params.decimation_target, verbose=False)
-        logger.debug(f"After final simplification: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
-        
-        # Step 4: Final Cleanup loop
-        cumesh_mesh.remove_duplicate_faces()
-        cumesh_mesh.repair_non_manifold_edges()
-        cumesh_mesh.remove_small_connected_components(1e-5)
-        cumesh_mesh.fill_holes(max_hole_perimeter=3e-2)
-        logger.debug(f"After final cleanup: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
+            cumesh_mesh.simplify(params.decimation_target * 3, verbose=False)
+            logger.debug(f"After initial simplification: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
 
-        hole_count = count_boundary_loops(*cumesh_mesh.read())
-        logger.debug(f"Holes after cleanup: {hole_count}")
+            cumesh_mesh.remove_duplicate_faces()
+            cumesh_mesh.repair_non_manifold_edges()
+            cumesh_mesh.remove_small_connected_components(1e-5)
+            cumesh_mesh.fill_holes(max_hole_perimeter=3e-2)
+            logger.debug(f"After initial cleanup: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
 
-        # Step 5: Unify face orientations
-        cumesh_mesh.unify_face_orientations()
+            cumesh_mesh.simplify(params.decimation_target, verbose=False)
+            logger.debug(f"After final simplification: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
 
-        # Extract cleaned mesh data
-        vertices, faces = cumesh_mesh.read()
-        return MeshData(
-            vertices=vertices,
-            faces=faces
-        )
+            cumesh_mesh.remove_duplicate_faces()
+            cumesh_mesh.repair_non_manifold_edges()
+            cumesh_mesh.remove_small_connected_components(1e-5)
+            cumesh_mesh.fill_holes(max_hole_perimeter=3e-2)
+            logger.debug(f"After final cleanup: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
+
+            hole_count = count_boundary_loops(*cumesh_mesh.read())
+            logger.debug(f"Holes after cleanup: {hole_count}")
+
+            cumesh_mesh.unify_face_orientations()
+
+            vertices, faces = cumesh_mesh.read()
+            return MeshData(vertices=vertices, faces=faces)
+        except RuntimeError as e:
+            if _is_cuda_oom(e):
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                logger.warning(f"CuMesh OOM in _cleanup_mesh, returning mesh without cleanup: {e}")
+                return MeshData(
+                    vertices=original_mesh_data.vertices,
+                    faces=original_mesh_data.faces,
+                )
+            raise
 
     def _remesh_mesh(self, original_mesh_data: MeshDataWithAttributeGrid, params: GLBConverterParams) -> MeshData:
         """Remesh the given mesh to improve quality."""
-
-        # Create cumesh from current mesh data
         logger.debug("Starting remeshing")
         start_time = time.time()
 
-        cumesh_mesh = cumesh.CuMesh()
-        cumesh_mesh.init(original_mesh_data.vertices, original_mesh_data.faces)
+        try:
+            cumesh_mesh = cumesh.CuMesh()
+            cumesh_mesh.init(original_mesh_data.vertices, original_mesh_data.faces)
 
-        if params.smooth_mesh:
-            logger.debug(f"Applying Taubin smoothing: iterations={params.smooth_iterations}, lambda={params.smooth_lambda}")
-            smoothed_vertices = taubin_smooth(
-                original_mesh_data,
-                iterations=params.smooth_iterations,
-                lambda_factor=params.smooth_lambda,
-                mu_factor=-(params.smooth_lambda + 0.01),
+            if params.smooth_mesh:
+                logger.debug(f"Applying Taubin smoothing: iterations={params.smooth_iterations}, lambda={params.smooth_lambda}")
+                smoothed_vertices = taubin_smooth(
+                    original_mesh_data,
+                    iterations=params.smooth_iterations,
+                    lambda_factor=params.smooth_lambda,
+                    mu_factor=-(params.smooth_lambda + 0.01),
+                )
+                cumesh_mesh.init(smoothed_vertices, original_mesh_data.faces)
+                logger.debug(f"Done smoothing | Time: {time.time() - start_time:.2f}s")
+
+            voxel_size = original_mesh_data.attrs.voxel_size
+            aabb = original_mesh_data.attrs.aabb
+            grid_size = ((aabb[1] - aabb[0]) / voxel_size).round().int()
+
+            resolution = grid_size.max().item()
+            center = aabb.mean(dim=0)
+            scale = (aabb[1] - aabb[0]).max().item()
+
+            vertices, faces = cumesh.remeshing.remesh_narrow_band_dc(
+                *cumesh_mesh.read(),
+                center=center,
+                scale=(resolution + 3 * params.remesh_band) / resolution * scale,
+                resolution=resolution,
+                band=params.remesh_band,
+                project_back=params.remesh_project,
+                verbose=False,
+                bvh=original_mesh_data.bvh,
             )
-            cumesh_mesh.init(smoothed_vertices, original_mesh_data.faces)
-            logger.debug(f"Done smoothing | Time: {time.time() - start_time:.2f}s")
+            cumesh_mesh.init(vertices, faces)
+            logger.debug(f"After remeshing: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
 
-        voxel_size = original_mesh_data.attrs.voxel_size
-        aabb = original_mesh_data.attrs.aabb
-        grid_size = ((aabb[1] - aabb[0]) / voxel_size).round().int()
+            cumesh_mesh.simplify(params.decimation_target, verbose=False)
+            logger.debug(f"After simplifying: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
 
-        resolution = grid_size.max().item()
-        center = aabb.mean(dim=0)
-        scale = (aabb[1] - aabb[0]).max().item()
-        
-        # Perform Dual Contouring remeshing (rebuilds topology)
-        vertices, faces = cumesh.remeshing.remesh_narrow_band_dc(
-            *cumesh_mesh.read(),
-            center=center,
-            scale=(resolution + 3 * params.remesh_band) / resolution * scale,
-            resolution=resolution,
-            band=params.remesh_band,
-            project_back=params.remesh_project,  # Snaps vertices back to original surface
-            verbose=False,
-            bvh=original_mesh_data.bvh,
-        )
-        cumesh_mesh.init(vertices, faces)
-        logger.debug(f"After remeshing: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
-        
-        # Simplify and clean the remeshed result
-        cumesh_mesh.simplify(params.decimation_target, verbose=False)
-        logger.debug(f"After simplifying: {cumesh_mesh.num_vertices} vertices, {cumesh_mesh.num_faces} faces")
+            vertices, faces = cumesh_mesh.read()
+            hole_count = count_boundary_loops(vertices, faces)
+            logger.debug(f"Holes after remesh: {hole_count}")
 
-        # Extract remeshed data
-        vertices, faces = cumesh_mesh.read()
-        hole_count = count_boundary_loops(vertices, faces)
-        logger.debug(f"Holes after remesh: {hole_count}")
-
-        logger.debug(f"Done remeshing | Time: {time.time() - start_time:.2f}s")
-        return MeshData(
-            vertices=vertices,
-            faces=faces
-        )
+            logger.debug(f"Done remeshing | Time: {time.time() - start_time:.2f}s")
+            return MeshData(vertices=vertices, faces=faces)
+        except RuntimeError as e:
+            if _is_cuda_oom(e):
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                logger.warning(f"CuMesh OOM in _remesh_mesh, falling back to cleanup only: {e}")
+                return self._cleanup_mesh(original_mesh_data, params)
+            raise
 
     def _uv_unwrap_mesh(self, mesh_data: MeshData, params: GLBConverterParams) -> MeshData:
         """Perform UV unwrapping on the mesh."""
-        # Create cumesh from current mesh data
         logger.debug("Starting UV unwrapping")
         start_time = time.time()
-        
-        cumesh_mesh = cumesh.CuMesh()
-        cumesh_mesh.init(mesh_data.vertices, mesh_data.faces)
-        
+
+        num_vertices = mesh_data.vertices.shape[0]
+        num_faces = mesh_data.faces.shape[0]
+        if num_faces > params.trivial_uv_max_faces or num_vertices > params.trivial_uv_max_vertices:
+            logger.warning(
+                f"Mesh too large for CuMesh/xatlas (vertices={num_vertices}, faces={num_faces} "
+                f"> {params.trivial_uv_max_vertices}/{params.trivial_uv_max_faces}); using trivial UVs."
+            )
+            self.last_uv_unwrap_info = {"mode": "trivial", "reason": "size", "num_charts": None}
+            return _trivial_uvs_and_normals_gpu(mesh_data.vertices, mesh_data.faces, self.device)
+
+        compute_charts_kwargs = {
+            "threshold_cone_half_angle_rad": np.radians(params.mesh_cluster_threshold_cone_half_angle),
+            "refine_iterations": params.mesh_cluster_refine_iterations,
+            "global_iterations": params.mesh_cluster_global_iterations,
+            "smooth_strength": params.mesh_cluster_smooth_strength,
+        }
         xatlas_compute_charts_kwargs = {
             "max_chart_area": 1.0,
             "max_boundary_length": 2.0,
@@ -238,34 +286,55 @@ class GLBConverter:
             "normal_deviation_weight": 1.0,
             "fix_winding": True
         }
-        
-        out_vertices, out_faces, out_uvs, out_vmaps = cumesh_mesh.uv_unwrap(
-            compute_charts_kwargs={
-                "threshold_cone_half_angle_rad": np.radians(params.mesh_cluster_threshold_cone_half_angle),
-                "refine_iterations": params.mesh_cluster_refine_iterations,
-                "global_iterations": params.mesh_cluster_global_iterations,
-                "smooth_strength": params.mesh_cluster_smooth_strength,
-            },
-            xatlas_compute_charts_kwargs=xatlas_compute_charts_kwargs,
-            return_vmaps=True,
-            verbose=True,
-        )
-        out_vertices = out_vertices.to(self.device)
-        out_faces = out_faces.to(self.device)
-        out_uvs = out_uvs.to(self.device)
-        out_vmaps = out_vmaps.to(self.device)
-        
-        cumesh_mesh.compute_vertex_normals()
-        out_normals = cumesh_mesh.read_vertex_normals()[out_vmaps]
-        
-        logger.debug(f"Done UV unwrapping | Time: {time.time() - start_time:.2f}s")
-        
-        return MeshData(
-            vertices=out_vertices,
-            faces=out_faces,
-            vertex_normals=out_normals,
-            uvs=out_uvs
-        )
+
+        try:
+            cumesh_mesh = cumesh.CuMesh()
+            cumesh_mesh.init(mesh_data.vertices, mesh_data.faces)
+            # Get cluster count from the mesh (same clustering CuMesh uses); skip xatlas if too many to avoid segfault.
+            cumesh_mesh.compute_charts(**compute_charts_kwargs)
+            num_charts, _, _, _, _, _ = cumesh_mesh.read_atlas_charts()
+            if num_charts > params.max_xatlas_charts:
+                logger.warning(
+                    f"Chart count {num_charts} > max_xatlas_charts ({params.max_xatlas_charts}); "
+                    "using trivial UVs to avoid xatlas segfault."
+                )
+                self.last_uv_unwrap_info = {"mode": "trivial", "reason": "charts", "num_charts": int(num_charts)}
+                return _trivial_uvs_and_normals_gpu(mesh_data.vertices, mesh_data.faces, self.device)
+
+            out_vertices, out_faces, out_uvs, out_vmaps = cumesh_mesh.uv_unwrap(
+                compute_charts_kwargs=compute_charts_kwargs,
+                xatlas_compute_charts_kwargs=xatlas_compute_charts_kwargs,
+                return_vmaps=True,
+                verbose=True,
+            )
+            out_vertices = out_vertices.to(self.device)
+            out_faces = out_faces.to(self.device)
+            out_uvs = out_uvs.to(self.device)
+            out_vmaps = out_vmaps.to(self.device)
+
+            cumesh_mesh.compute_vertex_normals()
+            out_normals = cumesh_mesh.read_vertex_normals()[out_vmaps]
+
+            logger.debug(f"Done UV unwrapping | Time: {time.time() - start_time:.2f}s")
+            self.last_uv_unwrap_info = {"mode": "xatlas", "reason": None, "num_charts": int(num_charts)}
+
+            return MeshData(
+                vertices=out_vertices,
+                faces=out_faces,
+                vertex_normals=out_normals,
+                uvs=out_uvs
+            )
+        except RuntimeError as e:
+            if _is_cuda_oom(e):
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                logger.warning(
+                    f"CuMesh OOM in _uv_unwrap_mesh (atlas/compute_charts); "
+                    f"propagating for higher-level retry: {e}"
+                )
+                # Let the caller decide how to retry with lighter params.
+                raise
+            raise
 
     def _subdivide_mesh(self, mesh_data: MeshData, original_mesh_data: MeshDataWithAttributeGrid, params: GLBConverterParams) -> MeshData:
         """Subdivide mesh with uv data and optionally reproject vertices to original mesh surface."""

@@ -19,6 +19,10 @@ class GLBConverterParams(OverridableModel):
     mesh_cluster_global_iterations: int = 1
     mesh_cluster_smooth_strength: float = 1.0
     mesh_cluster_threshold_cone_half_angle: float = 90.0
+    # UV unwrap guards (all configurable). Above these we use planar UVs instead of CuMesh/xatlas.
+    trivial_uv_max_faces: int = 100_000
+    trivial_uv_max_vertices: int = 80_000
+    max_xatlas_charts: int = 5000
     subdivisions: int = 2
     vertex_reproject: float = 0.0
     alpha_gamma: float = 2.2

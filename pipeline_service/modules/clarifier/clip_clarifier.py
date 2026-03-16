@@ -60,12 +60,10 @@ class CLIPClarifier:
             "a blurry, abstract, or confusing image where the subject is not identifiable",
         ]
 
-        # Geometry regime: abstract prompts (no object examples) for decimation/remesh choice.
-        self._geometry_regime_order = ["simple", "complex_big", "complex_tiny"]
-        self._geometry_regime_prompts = [
-            "a simple smooth object with few parts",
-            "a complex object with large solid connected parts",
-            "a complex object with many small thin or fine detailed parts",
+        # Pipeline-type suggestion: simple → 1024_cascade (we have headroom); complex → 512 (avoid OOM).
+        self._pipeline_type_prompts = [
+            "a simple object with smooth surfaces and few details",
+            "a complex detailed object with many parts and fine geometry",
         ]
 
         # Coarse material/category labels: from caller (pipeline loads YAML) or load from YAML here (YAML is main source; loader fallback only if file missing).
@@ -280,21 +278,22 @@ class CLIPClarifier:
         )
         return (chosen, best_prob)
 
-    def classify_geometry_regime(self, image: Image.Image) -> Optional[str]:
+    def suggest_pipeline_type(self, image: Image.Image) -> Optional[str]:
         """
-        Classify the object's geometry regime from the image using CLIP (same model as category).
-        Returns one of: "simple", "complex_big", "complex_tiny". Returns None if clarifier disabled or not loaded.
-        Used to select per-regime decimation_target and remesh from config.
+        Suggest Trellis pipeline_type from the image using CLIP: '512' (simple) or '1024_cascade' (complex).
+        Uses rembg'd image to predict whether the object is simple (→ 512, lighter) or complex (→ 1024_cascade).
+        Returns None if clarifier is disabled or suggest_pipeline_type is False.
         """
-        if not self.settings.enabled or self._processor is None or self._model is None:
+        if not getattr(self.settings, "suggest_pipeline_type", True) or not self.settings.enabled:
+            return None
+        if self._processor is None or self._model is None:
             return None
 
         self._ensure_ready()
-        assert self._processor is not None
-        assert self._model is not None
+        assert self._processor is not None and self._model is not None
 
         inputs = self._processor(
-            text=self._geometry_regime_prompts,
+            text=self._pipeline_type_prompts,
             images=image,
             return_tensors="pt",
             padding=True,
@@ -302,13 +301,14 @@ class CLIPClarifier:
 
         with torch.no_grad():
             outputs = self._model(**inputs)
-            logits_per_image = outputs.logits_per_image[0]  # (num_prompts,)
+            logits_per_image = outputs.logits_per_image[0]
 
         probs = torch.softmax(logits_per_image.float(), dim=0)
         best_idx = int(torch.argmax(probs).item())
-        regime = self._geometry_regime_order[best_idx]
+        # 0 = simple → 1024_cascade (safe), 1 = complex → 512 (avoid OOM)
+        suggested = "1024_cascade" if best_idx == 0 else "512"
         logger.info(
-            f"Geometry regime: {regime} | probs simple={probs[0].item():.2f}, complex_big={probs[1].item():.2f}, complex_tiny={probs[2].item():.2f}"
+            f"Pipeline type suggestion: {suggested} | probs simple={probs[0].item():.2f}, complex={probs[1].item():.2f}"
         )
-        return regime
+        return suggested
 

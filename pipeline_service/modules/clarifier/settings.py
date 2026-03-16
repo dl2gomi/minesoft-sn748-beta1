@@ -15,4 +15,6 @@ class ClarifierConfig(ModelConfig):
     dtype: str = "bf16"
     # Optional path to category_config.yaml. If None, pipeline_service/category_config.yaml is used.
     category_config_path: Optional[str] = None
+    # If True, predict pipeline_type (512 vs 1024_cascade) from rembg'd image before Trellis; when False, use config/request only.
+    suggest_pipeline_type: bool = True
 

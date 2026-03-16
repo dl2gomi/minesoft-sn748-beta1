@@ -23,7 +23,7 @@ trellis:
   shape_slat_cfg_strength: 3.0
   tex_slat_steps: 12
   tex_slat_cfg_strength: 9.5
-  pipeline_type: "1024_cascade"  # "512", "1024_cascade"
+  pipeline_type: "512"  # "512", "1024_cascade"
   mode: "multidiffusion"  # "singleview", "multiview"
   # Legacy boolean kept for compatibility; use multiview_mode instead for new behavior.
   multiview: false
@@ -62,6 +62,8 @@ clarifier:
   # If mode is "dynamic" and score < reconstructability_threshold, we enable multiview.
   reconstructability_threshold: 0.3
   max_new_tokens: 128
+  # Predict pipeline_type (512 vs 1024_cascade) from rembg'd image before Trellis; set false to use config/request only.
+  suggest_pipeline_type: true
 
 # Background removal model settings
 background_removal:
@@ -74,7 +76,7 @@ background_removal:
 
 # GLB Converter settings
 glb_converter:
-  decimation_target: 150000
+  decimation_target: 250000
   texture_size: 2048
   # Use BLEND so transparent objects (glass, plastics, bottles) can preserve
   # their alpha. The converter will automatically switch to OPAQUE when the
@@ -91,6 +93,10 @@ glb_converter:
   mesh_cluster_refine_iterations: 0
   mesh_cluster_smooth_strength: 0.15
   mesh_cluster_threshold_cone_half_angle: 90
+  # UV unwrap guards: above trivial_uv_max_* we skip CuMesh; after clustering, if chart count > max_xatlas_charts we skip xatlas (use planar UVs).
+  trivial_uv_max_faces: 100000
+  trivial_uv_max_vertices: 80000
+  max_xatlas_charts: 5000
   smooth_mesh: true
   smooth_iterations: 5
   smooth_lambda: 0.5
@@ -101,19 +107,6 @@ glb_converter:
   color_saturation: 0.85
   # color_brightness: 1.0
   gpu: 0
-
-# Geometry regime (CLIP-based): decimation_target and remesh per regime.
-# Regimes: simple, complex_big, complex_tiny. Pipeline picks regime from image then applies these overrides.
-geometry_regime:
-  simple:
-    decimation_target: 110000
-    remesh: true
-  complex_big:
-    decimation_target: 240000
-    remesh: true
-  complex_tiny:
-    decimation_target: 160000
-    remesh: true
 
 # Judge model settings
 judge:
@@ -126,6 +119,9 @@ judge:
   gpu_memory_utilization: 0.175
   max_model_len: 8096
   max_num_seqs: 2
+  # If any GLB candidate exceeds this many bytes, skip the judge step and ignore that candidate.
+  # Set to 0 or negative to disable this guard. Example: 200MB -> 209715200.
+  max_glb_bytes_for_judge: 209715199
   
 # Model versions (pinned HuggingFace model revisions)
 model_versions:

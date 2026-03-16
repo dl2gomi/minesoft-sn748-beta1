@@ -33,52 +33,76 @@ class Mesh:
         return self.to('cpu')
     
     def fill_holes(self, max_hole_perimeter=3e-2):
-        vertices = self.vertices.cuda()
-        faces = self.faces.cuda()
-        
-        mesh = cumesh.CuMesh()
-        mesh.init(vertices, faces)
-        mesh.get_edges()
-        mesh.get_boundary_info()
-        if mesh.num_boundaries == 0:
-            return
-        mesh.get_vertex_edge_adjacency()
-        mesh.get_vertex_boundary_adjacency()
-        mesh.get_manifold_boundary_adjacency()
-        mesh.read_manifold_boundary_adjacency()
-        mesh.get_boundary_connected_components()
-        mesh.get_boundary_loops()
-        if mesh.num_boundary_loops == 0:
-            return
-        mesh.fill_holes(max_hole_perimeter=max_hole_perimeter)
-        new_vertices, new_faces = mesh.read()
-        
-        self.vertices = new_vertices.to(self.device)
-        self.faces = new_faces.to(self.device)
+        try:
+            vertices = self.vertices.cuda()
+            faces = self.faces.cuda()
+
+            mesh = cumesh.CuMesh()
+            mesh.init(vertices, faces)
+            mesh.get_edges()
+            mesh.get_boundary_info()
+            if mesh.num_boundaries == 0:
+                return
+            mesh.get_vertex_edge_adjacency()
+            mesh.get_vertex_boundary_adjacency()
+            mesh.get_manifold_boundary_adjacency()
+            mesh.read_manifold_boundary_adjacency()
+            mesh.get_boundary_connected_components()
+            mesh.get_boundary_loops()
+            if mesh.num_boundary_loops == 0:
+                return
+            mesh.fill_holes(max_hole_perimeter=max_hole_perimeter)
+            new_vertices, new_faces = mesh.read()
+
+            self.vertices = new_vertices.to(self.device)
+            self.faces = new_faces.to(self.device)
+        except RuntimeError as e:
+            err = str(e).lower()
+            if "out of memory" in err or "cuda" in err or "cumesh" in err:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return  # skip hole-filling; mesh remains as-is (may have small holes)
+            raise
         
     def remove_faces(self, face_mask: torch.Tensor):
-        vertices = self.vertices.cuda()
-        faces = self.faces.cuda()
-        
-        mesh = cumesh.CuMesh()
-        mesh.init(vertices, faces)
-        mesh.remove_faces(face_mask)
-        new_vertices, new_faces = mesh.read()
-        
-        self.vertices = new_vertices.to(self.device)
-        self.faces = new_faces.to(self.device)
+        try:
+            vertices = self.vertices.cuda()
+            faces = self.faces.cuda()
+
+            mesh = cumesh.CuMesh()
+            mesh.init(vertices, faces)
+            mesh.remove_faces(face_mask)
+            new_vertices, new_faces = mesh.read()
+
+            self.vertices = new_vertices.to(self.device)
+            self.faces = new_faces.to(self.device)
+        except RuntimeError as e:
+            err = str(e).lower()
+            if "out of memory" in err or "cuda" in err or "cumesh" in err:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return  # skip face removal; mesh remains as-is
+            raise
         
     def simplify(self, target=1000000, verbose: bool=False, options: dict={}):
-        vertices = self.vertices.cuda()
-        faces = self.faces.cuda()
-        
-        mesh = cumesh.CuMesh()
-        mesh.init(vertices, faces)
-        mesh.simplify(target, verbose=verbose, options=options)
-        new_vertices, new_faces = mesh.read()
-        
-        self.vertices = new_vertices.to(self.device)
-        self.faces = new_faces.to(self.device)
+        try:
+            vertices = self.vertices.cuda()
+            faces = self.faces.cuda()
+
+            mesh = cumesh.CuMesh()
+            mesh.init(vertices, faces)
+            mesh.simplify(target, verbose=verbose, options=options)
+            new_vertices, new_faces = mesh.read()
+
+            self.vertices = new_vertices.to(self.device)
+            self.faces = new_faces.to(self.device)
+        except RuntimeError as e:
+            err = str(e).lower()
+            if "out of memory" in err or "cuda" in err or "cumesh" in err:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return  # skip simplification; mesh remains as-is
+            raise
 
 
 class TextureFilterMode:

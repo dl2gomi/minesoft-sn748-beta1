@@ -76,6 +76,7 @@ class VllmJudgePipeline(JudgePipeline):
                 seed=call_seed,
             )
             content = (completion.choices[0].message.content or "").strip()
+
             return parse_penalty(content), ""
 
         # Second call uses a different seed (bounded so it never overflows 31-bit)
