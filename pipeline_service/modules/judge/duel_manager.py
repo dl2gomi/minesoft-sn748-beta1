@@ -1,5 +1,6 @@
 import base64
 import time
+from pathlib import Path
 from typing import Optional, Tuple
 
 from logger_config import logger
@@ -78,12 +79,44 @@ class DuelManager:
             png_bytes = self.renderer.grid_from_glb_bytes(mesh.file_bytes)
             if png_bytes is None:
                 logger.warning(
-                    f"Renderer returned None for mesh {idx} – skipping judge, returning first mesh"
+                    f"Renderer returned None for mesh {idx} - skipping judge, returning first mesh"
                 )
                 return None
             rendered.append(png_bytes)
             logger.debug(f"Mesh {idx} rendered to PNG grid ({len(png_bytes)} bytes)")
         return rendered
+
+    def save_candidate_renders(
+        self,
+        meshes: list[TrellisResult],
+        output_dir: Path,
+        basename: str,
+    ) -> None:
+        """
+        Render all candidate meshes and save their PNGs as
+        {basename}_candidate_0.png, {basename}_candidate_1.png, ...
+
+        This is intentionally decoupled from the judge logic so that
+        candidates are saved even if the judge pipeline fails.
+        """
+        if not meshes:
+            return
+        if self.renderer is None:
+            logger.warning("No renderer provided to DuelManager - cannot save candidate renders")
+            return
+
+        rendered = self._render_meshes(meshes)
+        if rendered is None:
+            return
+
+        out = Path(output_dir).resolve()
+        out.mkdir(parents=True, exist_ok=True)
+
+        for i, png_bytes in enumerate(rendered):
+            path = out / f"{basename}_candidate_{i}.png"
+            path.write_bytes(png_bytes)
+
+        logger.info("Saved %d duel candidate PNGs to %s (e.g. %s)", len(rendered), out, out / f"{basename}_candidate_0.png")
 
     async def judge_meshes(
         self,
@@ -91,28 +124,23 @@ class DuelManager:
         meshes: list[TrellisResult],
         prompt_image_b64: str,
         seed: int,
-    ) -> int:
+    ) -> Tuple[int, str]:
         """
         Judge a list of meshes by rendering them and comparing with the judge pipeline.
 
-        Args:
-            pipeline: Loaded judge pipeline used for inference.
-            meshes: List of meshes to judge.
-            prompt_image_b64: Original prompt image as base64 string (used as reference).
-            seed: Random seed for reproducibility.
-
         Returns:
-            Index of the winning mesh.
+            Tuple of (winner_index, duel_explanation). duel_explanation is the combined
+            issues from all duels (from vLLM judge); empty string if no duel ran.
         """
         t1 = time.time()
 
         if len(meshes) < 2:
             logger.warning("Less than 2 meshes provided to judge")
-            return 0
+            return 0, ""
 
         if self.renderer is None:
-            logger.warning("No renderer provided to DuelManager – skipping judge, returning first mesh")
-            return 0
+            logger.warning("No renderer provided to DuelManager - skipping judge, returning first mesh")
+            return 0, ""
 
         logger.info(f"Judging {len(meshes)} meshes with prompt image")
 
@@ -120,19 +148,24 @@ class DuelManager:
 
         rendered = self._render_meshes(meshes)
         if rendered is None:
-            return 0
+            return 0, ""
 
         best_idx = 0
+        all_issues: list[str] = []
         for i in range(1, len(rendered)):
             winner, issues = await self.run_duel(
                 pipeline, prompt_bytes, rendered[best_idx], rendered[i], seed
             )
+            if issues:
+                all_issues.append(issues)
             logger.info(f"Duel [{best_idx} vs {i}] → winner: {i if winner == 1 else best_idx} {issues}")
             if winner == 1:  # Image 2 wins → update best candidate
                 best_idx = i
+
+        duel_explanation = " ".join(all_issues).strip() if all_issues else ""
 
         logger.success(
             f"Judging {len(meshes)} meshes with prompt image took {time.time() - t1:.2f}s | Winner: {best_idx}"
         )
 
-        return best_idx
+        return best_idx, duel_explanation

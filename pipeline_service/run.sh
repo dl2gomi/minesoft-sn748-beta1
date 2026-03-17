@@ -46,9 +46,6 @@ if [ "$JUDGE_ENABLED" = "true" ]; then
     echo "GPU Util: $GPU_UTIL"
     echo "Max model len: $MAX_MODEL_LEN  Max num seqs: $MAX_NUM_SEQS"
 
-    # Use legacy engine (v0) to avoid v1 EngineCore/determine_available_memory failures
-    export VLLM_USE_V1=0
-
     # Start vLLM server in background
     /opt/vllm-env/bin/vllm serve "$VLLM_MODEL" \
         --revision "$VLLM_REVISION" \

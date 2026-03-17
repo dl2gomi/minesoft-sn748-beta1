@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import re
-
+import json
 import httpx
 from openai import AsyncOpenAI
 
 from logger_config import logger
 from .judge_pipeline import JudgePipeline
-from .prompting import SYSTEM_PROMPT, JUDGE_SINGLE_IMAGE_USER
+from .prompting import SYSTEM_PROMPT, USER_PROMPT_IMAGE
 from .schemas import JudgeResponse
 from .settings import JudgeConfig
 from modules.utils import set_random_seed
@@ -42,51 +41,101 @@ class VllmJudgePipeline(JudgePipeline):
         img2_b64: str,
         seed: int,
     ) -> JudgeResponse:
-        """Call vLLM to compare two candidate images. Uses 2 separate calls (1 image each)
-        because GLM-4.1V / vLLM allows at most 1 image per request."""
+        """
+        Call vLLM once to compare two candidates (prompt + left + right images).
+        Request JSON output and parse into JudgeResponse.
+        """
         assert self.client is not None, "VllmJudgePipeline is not initialized."
-
-        user_text = JUDGE_SINGLE_IMAGE_USER
 
         set_random_seed(seed)
 
-        def parse_penalty(content: str) -> int:
-            """Extract a number 0-10 from model output. Default 5 if missing/invalid."""
-            match = re.search(r"\b(10|[0-9])\b", content)
-            if match:
-                return min(10, max(0, int(match.group(1))))
-            return 5
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Image prompt to generate 3D model:"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{prompt_b64}"}},
+                    {"type": "text", "text": "First 3D model (4 different views):"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img1_b64}"}},
+                    {"type": "text", "text": "Second 3D model (4 different views):"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img2_b64}"}},
+                    {"type": "text", "text": USER_PROMPT_IMAGE},
+                ],
+            },
+        ]
 
-        async def one_call(img_b64: str, call_seed: int) -> tuple[int, str]:
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
-                    ],
-                },
-            ]
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "judge-response",
+                "schema": JudgeResponse.model_json_schema(),
+            },
+        }
+
+        try:
             completion = await self.client.chat.completions.create(
                 model=self.settings.vllm_model_name,
                 messages=messages,
                 temperature=0.0,
-                max_tokens=16,
-                seed=call_seed,
+                max_tokens=1024,
+                seed=seed,
+                response_format=response_format,
+            )
+
+            content = (completion.choices[0].message.content or "").strip()
+            return JudgeResponse.model_validate_json(content)
+        except Exception as e:
+            # If response_format isn't supported (or the model emits non-JSON),
+            # retry once without response_format and extract JSON from raw content.
+            if "response_format" in str(e).lower() or "json_schema" in str(e).lower():
+                return await self._judge_retry_parse(messages=messages, seed=seed, original_exc=e)
+            logger.error(f"vLLM judge call failed: {e}")
+            return JudgeResponse(penalty_1=5, penalty_2=5, issues="vLLM call failed")
+
+    async def _judge_retry_parse(
+        self,
+        *,
+        messages: list,
+        seed: int,
+        original_exc: Exception,
+    ) -> JudgeResponse:
+        """Retry without response_format and parse JSON from raw model content."""
+        assert self.client is not None, "VllmJudgePipeline is not initialized."
+        logger.warning(f"Judge response_format not supported, parsing JSON from content: {original_exc}")
+        try:
+            completion = await self.client.chat.completions.create(
+                model=self.settings.vllm_model_name,
+                messages=messages,
+                temperature=0.0,
+                max_tokens=1024,
+                seed=seed,
             )
             content = (completion.choices[0].message.content or "").strip()
-
-            return parse_penalty(content), ""
-
-        # Second call uses a different seed (bounded so it never overflows 31-bit)
-        seed_2 = (seed + 1) & 0x7FFFFFFF
-
-        try:
-            penalty_1, _ = await one_call(img1_b64, seed)
-            penalty_2, _ = await one_call(img2_b64, seed_2)
-            issues = ""
-            return JudgeResponse(penalty_1=penalty_1, penalty_2=penalty_2, issues=issues)
+            # Extract JSON object: find first { and matching }
+            start = content.find("{")
+            if start < 0:
+                return JudgeResponse(penalty_1=5, penalty_2=5, issues="")
+            depth = 1
+            pos = start + 1
+            end = -1
+            while pos < len(content):
+                if content[pos] == "{":
+                    depth += 1
+                elif content[pos] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = pos + 1
+                        break
+                pos += 1
+            if end < 0:
+                return JudgeResponse(penalty_1=5, penalty_2=5, issues="")
+            data = json.loads(content[start:end])
+            return JudgeResponse(
+                penalty_1=int(data.get("penalty_1", 5)),
+                penalty_2=int(data.get("penalty_2", 5)),
+                issues=str(data.get("issues", ""))[:500],
+            )
         except Exception as e:
-            logger.error(f"vLLM call failed: {e}")
+            logger.warning(f"VLM judge fallback parse failed: {e}; using safe defaults.")
             return JudgeResponse(penalty_1=5, penalty_2=5, issues="vLLM call failed")

@@ -19,7 +19,13 @@ class MeshGeneratorModule:
     def __init__(self, default_params: TrellisParams):
         self.default_params = default_params
 
-    def generate(self, model: MeshGenerationPipeline, request: TrellisRequest) -> list[MeshWithVoxel]:
+    def generate(
+        self,
+        model: MeshGenerationPipeline,
+        request: TrellisRequest,
+        *,
+        default_params: TrellisParams | None = None,
+    ) -> list[MeshWithVoxel]:
         assert model.is_ready(), f"{model.settings.model_id} pipeline not loaded."
 
         set_random_seed(request.seed)
@@ -28,7 +34,8 @@ class MeshGeneratorModule:
         images_rgb = [image.convert("RGB") for image in images]
         num_images = len(images_rgb)
 
-        params = self.default_params.overrided(request.params)
+        base = default_params or self.default_params
+        params = base.overrided(request.params)
 
         logger.info(
             f"Generating Trellis {request.seed=} and image size {images[0].size} "

@@ -1,20 +1,18 @@
 from typing import Optional
 
-from config.types import ModelConfig
+from pydantic import BaseModel, ConfigDict
 
 
-class ClarifierConfig(ModelConfig):
+class ClarifierConfig(BaseModel):
     """
-    Settings for the clarifier VLM that scores 3D reconstructability
-    from a single input image.
+    Pre-decision step (category, multiview, pipeline). When enabled,
+    the decision module (vLLM) returns all three in one call.
     """
+
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = True
-    reconstructability_threshold: float = 0.7
-    max_new_tokens: int = 128
-    dtype: str = "bf16"
-    # Optional path to category_config.yaml. If None, pipeline_service/category_config.yaml is used.
+    # If false, category will be ignored for GLB texture/material mapping (no per-category presets),
+    # while multiview/pipeline decisions can still be used.
+    use_category_clarification: bool = True
     category_config_path: Optional[str] = None
-    # If True, predict pipeline_type (512 vs 1024_cascade) from rembg'd image before Trellis; when False, use config/request only.
-    suggest_pipeline_type: bool = True
-

@@ -9,31 +9,35 @@ class GenerationResponse(BaseModel):
     grid_view_file_base64: Optional[str | bytes] = None
     image_edited_file_base64: Optional[str] = None
     image_without_background_file_base64: Optional[str] = None
-    # Clarifier / multiview metadata (for logging; set when multiview_mode is dynamic)
-    clarifier_score: Optional[float] = None
+    # Decision module (vLLM): multiview, category, pipeline
     multiview_used: Optional[bool] = None
-    clarifier_explanation: Optional[str] = None
     object_category: Optional[str] = None
-    object_category_confidence: Optional[float] = None
-    # Extra debugging / logging metadata
-    trellis_pipeline_type: Optional[str] = None
-    suggested_pipeline_type: Optional[str] = None
+    decision_pipeline: Optional[str] = None  # pipeline chosen by vLLM decision ("512" or "1024_cascade")
+    pipeline_used: Optional[str] = None
+    decision_explanation: Optional[str] = None
+    trellis_oom_retry: Optional[bool] = None
+    # UV unwrap (winner GLB)
     uv_unwrap_mode: Optional[str] = None
     uv_unwrap_reason: Optional[str] = None
     uv_num_charts: Optional[int] = None
+    cluster_count: Optional[int] = None  # same as uv_num_charts when from xatlas/trivial
+    # Duel (when 2+ candidates and judge ran)
+    duel_done: Optional[bool] = None
+    duel_winner: Optional[int] = None  # index of winning candidate (0, 1, ...)
+    duel_explanation: Optional[str] = None  # issues from vLLM judge
 
     class Config:
         json_schema_extra = {
             "example": {
                 "generation_time": 7.2,
-                "glb_file_base64": "base64_encoded_glb_file",
-                "grid_view_file_base64": "base64_encoded_grid_view_file",
-                "image_edited_file_base64": "base64_encoded_image_edited_file",
-                "image_without_background_file_base64": "base64_encoded_image_without_background_file",
-                "clarifier_score": 0.45,
                 "multiview_used": True,
-                "clarifier_explanation": "Unseen sides are hard to infer.",
                 "object_category": "plastic",
-                "object_category_confidence": 0.72,
+                "decision_pipeline": "1024_cascade",
+                "pipeline_used": "512",
+                "decision_explanation": "Object is simple; single view sufficient.",
+                "trellis_oom_retry": True,
+                "duel_done": True,
+                "duel_winner": 1,
+                "duel_explanation": "| Direct: First model has texture issues | Swapped: ...",
             }
         }

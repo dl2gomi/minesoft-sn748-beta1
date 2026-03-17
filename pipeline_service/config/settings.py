@@ -44,7 +44,7 @@ class ModelVersionsConfig(BaseModel):
 class SettingsConf(BaseSettings):
     """Main settings class"""
     api: APIConfig = APIConfig()
-    output: OutputConfig 
+    output: OutputConfig = OutputConfig()
     trellis: TrellisConfig
     qwen: QwenConfig
     background_removal: BackgroundRemovalConfig
@@ -53,14 +53,24 @@ class SettingsConf(BaseSettings):
     judge: JudgeConfig
     clarifier: ClarifierConfig
     
-def _load_yml_config(path: Path):
-    """Classmethod returns YAML config"""
+def _load_yml_config(path: Path) -> dict:
+    """Load YAML config from disk (dict)."""
     try:
-        return yaml.safe_load(path.read_text())
-
+        data = yaml.safe_load(path.read_text())
     except FileNotFoundError as error:
         message = "Error: yml config file not found."
         raise FileNotFoundError(error, message) from error
+    return data or {}
 
-data_yaml = _load_yml_config(config_file_dir)
-settings = SettingsConf.model_validate(data_yaml)
+
+def load_settings(path: Path = config_file_dir) -> SettingsConf:
+    """
+    Load settings from YAML on demand.
+    Used to support request-scoped config reloads without restarting the service.
+    """
+    data_yaml = _load_yml_config(path)
+    return SettingsConf.model_validate(data_yaml)
+
+
+# Default settings loaded at import time (can be reloaded per-request via load_settings()).
+settings = load_settings()

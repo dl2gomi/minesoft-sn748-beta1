@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from config.settings import settings
+from config.settings import settings, load_settings
 from logger_config import logger
 from schemas.requests import GenerationRequest
 from schemas.responses import GenerationResponse
@@ -61,8 +61,9 @@ async def generate_from_base64(request: GenerationRequest) -> GenerationResponse
 
     Returns JSON with generation_time and base64 encoded outputs.
     """
+    current_settings = load_settings()
     try:
-        result = await asyncio.wait_for(pipeline.generate(request), timeout=settings.api.timeout)
+        result = await asyncio.wait_for(pipeline.generate(request, settings=current_settings), timeout=current_settings.api.timeout)
 
         if request.render_grid_view and result.glb_file_base64:
             grid_view_bytes = renderer.grid_from_glb_bytes(result.glb_file_base64)
@@ -75,7 +76,7 @@ async def generate_from_base64(request: GenerationRequest) -> GenerationResponse
         return result
 
     except asyncio.TimeoutError:
-        logger.error(f"Generation timed out after {settings.api.timeout} seconds")
+        logger.error(f"Generation timed out after {current_settings.api.timeout} seconds")
         raise HTTPException(status_code=408, detail="timeout") from None
     except Exception as exc:
         logger.exception(f"Error generating task: {exc}")
@@ -86,15 +87,15 @@ async def generate_from_base64(request: GenerationRequest) -> GenerationResponse
 async def generate(prompt_image_file: UploadFile = File(...), seed: int = Form(-1)) -> StreamingResponse:
     """
     Upload image file and generate 3D model as GLB buffer.
-    Returns binary GLB file. Response headers include metadata for logging:
-    X-Generation-Time, X-Clarifier-Score, X-Multiview-Used, X-Clarifier-Explanation, X-Object-Category, X-Geometry-Regime.
+    Returns binary GLB file. Response headers include metadata for results logging.
     """
+    current_settings = load_settings()
     try:
         logger.info(f"Task received. Uploading image: {prompt_image_file.filename}")
 
         result = await asyncio.wait_for(
-            pipeline.generate_from_upload(await prompt_image_file.read(), seed, input_filename=prompt_image_file.filename or None),
-            timeout=settings.api.timeout
+            pipeline.generate_from_upload(await prompt_image_file.read(), seed, input_filename=prompt_image_file.filename or None, settings=current_settings),
+            timeout=current_settings.api.timeout
         )
 
         glb_bytes = result.glb_file_base64 if isinstance(result.glb_file_base64, bytes) else (base64.b64decode(result.glb_file_base64) if result.glb_file_base64 else b"")
@@ -102,31 +103,38 @@ async def generate(prompt_image_file: UploadFile = File(...), seed: int = Form(-
         buffer_size = len(glb_bytes)
         glb_buffer.seek(0)
 
+        def _h(s: str, max_len: int = 512) -> str:
+            return (s or "").replace("\n", " ").strip()[:max_len]
+
         headers = {"Content-Length": str(buffer_size)}
         if result.generation_time is not None:
             headers["X-Generation-Time"] = f"{result.generation_time:.3f}"
-        if result.clarifier_score is not None:
-            headers["X-Clarifier-Score"] = f"{result.clarifier_score:.4f}"
         if result.multiview_used is not None:
             headers["X-Multiview-Used"] = "true" if result.multiview_used else "false"
-        if result.clarifier_explanation:
-            # Truncate and sanitize for header (no newlines)
-            expl = (result.clarifier_explanation or "").replace("\n", " ").strip()[:256]
-            headers["X-Clarifier-Explanation"] = expl
         if result.object_category:
             headers["X-Object-Category"] = result.object_category
-        if result.object_category_confidence is not None:
-            headers["X-Object-Category-Score"] = f"{result.object_category_confidence:.4f}"
-        if getattr(result, "trellis_pipeline_type", None):
-            headers["X-Trellis-Pipeline-Type"] = str(result.trellis_pipeline_type)
-        if getattr(result, "suggested_pipeline_type", None):
-            headers["X-Trellis-Pipeline-Type-Suggested"] = str(result.suggested_pipeline_type)
-        if getattr(result, "uv_unwrap_mode", None):
+        if result.decision_pipeline:
+            headers["X-Decision-Pipeline"] = str(result.decision_pipeline)
+        if result.pipeline_used:
+            headers["X-Pipeline-Used"] = result.pipeline_used
+        if result.decision_explanation:
+            headers["X-Decision-Explanation"] = _h(result.decision_explanation)
+        if result.trellis_oom_retry is not None:
+            headers["X-Trellis-OOM-Retry"] = "true" if result.trellis_oom_retry else "false"
+        if result.uv_unwrap_mode:
             headers["X-UV-Unwrap-Mode"] = str(result.uv_unwrap_mode)
-        if getattr(result, "uv_unwrap_reason", None):
+        if result.uv_unwrap_reason:
             headers["X-UV-Unwrap-Reason"] = str(result.uv_unwrap_reason)
-        if getattr(result, "uv_num_charts", None) is not None:
+        if result.uv_num_charts is not None:
             headers["X-UV-Num-Charts"] = str(result.uv_num_charts)
+        if result.cluster_count is not None:
+            headers["X-Cluster-Count"] = str(result.cluster_count)
+        if result.duel_done is not None:
+            headers["X-Duel-Done"] = "true" if result.duel_done else "false"
+        if result.duel_winner is not None:
+            headers["X-Duel-Winner"] = str(result.duel_winner)
+        if result.duel_explanation:
+            headers["X-Duel-Explanation"] = _h(result.duel_explanation)
 
         logger.info(f"Task completed. GLB size: {buffer_size} bytes")
 
@@ -137,7 +145,7 @@ async def generate(prompt_image_file: UploadFile = File(...), seed: int = Form(-
         )
 
     except asyncio.TimeoutError:
-        logger.error(f"Generation timed out after {settings.api.timeout} seconds")
+        logger.error(f"Generation timed out after {current_settings.api.timeout} seconds")
         raise HTTPException(status_code=408, detail="timeout") from None
     except Exception as exc:
         logger.exception(f"Error generating from upload: {exc}")
@@ -147,12 +155,10 @@ async def generate(prompt_image_file: UploadFile = File(...), seed: int = Form(-
 async def get_setup_info() -> dict:
     """
     Get current pipeline configuration for experiment logging.
-    
-    Returns:
-        dict: Pipeline configuration settings
+    Loads configuration from disk so changes take effect without restart.
     """
     try:
-        return settings.model_dump()
+        return load_settings().model_dump()
     except Exception as e:
         logger.error(f"Failed to get setup info: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve configuration")

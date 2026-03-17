@@ -23,14 +23,12 @@ trellis:
   shape_slat_cfg_strength: 3.0
   tex_slat_steps: 12
   tex_slat_cfg_strength: 9.5
-  pipeline_type: "512"  # "512", "1024_cascade"
+  pipeline_type: "1024_cascade"  # "512", "1024_cascade"
   mode: "multidiffusion"  # "singleview", "multiview"
-  # Legacy boolean kept for compatibility; use multiview_mode instead for new behavior.
-  multiview: false
   # New multiview behavior:
   # - "off": always single-view (no extra Qwen views)
   # - "always": always multiview (current behavior when multiview=true)
-  # - "dynamic": decide per-image using clarifier VLM score
+  # - "dynamic": decide per-image using decision module (vLLM)
   multiview_mode: "dynamic"
   num_samples: 2
   gpu: 0
@@ -53,17 +51,12 @@ qwen:
   gpu: 0
   dtype: "bf16"
 
+# Pre-decision (category, multiview, pipeline) via vLLM decision module
 clarifier:
   enabled: true
-  model_id: "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
-  gpu: 0
-  dtype: "bf16"
-  # Threshold on [0, 1]; lower scores mean geometry is harder to infer from a single view.
-  # If mode is "dynamic" and score < reconstructability_threshold, we enable multiview.
-  reconstructability_threshold: 0.3
-  max_new_tokens: 128
-  # Predict pipeline_type (512 vs 1024_cascade) from rembg'd image before Trellis; set false to use config/request only.
-  suggest_pipeline_type: true
+  # If false, ignore category for GLB material mapping (no per-category presets).
+  use_category_clarification: false
+  # category_config_path: optional path to category_config.yaml; default is pipeline_service/category_config.yaml
 
 # Background removal model settings
 background_removal:
@@ -76,7 +69,7 @@ background_removal:
 
 # GLB Converter settings
 glb_converter:
-  decimation_target: 250000
+  decimation_target: 200000
   texture_size: 2048
   # Use BLEND so transparent objects (glass, plastics, bottles) can preserve
   # their alpha. The converter will automatically switch to OPAQUE when the
@@ -89,17 +82,17 @@ glb_converter:
   remesh: true
   remesh_band: 1
   remesh_project: 0.1
-  mesh_cluster_global_iterations: 1
+  mesh_cluster_global_iterations: 2
   mesh_cluster_refine_iterations: 0
   mesh_cluster_smooth_strength: 0.15
-  mesh_cluster_threshold_cone_half_angle: 90
+  mesh_cluster_threshold_cone_half_angle: 100
   # UV unwrap guards: above trivial_uv_max_* we skip CuMesh; after clustering, if chart count > max_xatlas_charts we skip xatlas (use planar UVs).
-  trivial_uv_max_faces: 100000
-  trivial_uv_max_vertices: 80000
+  trivial_uv_max_faces: 300000
+  trivial_uv_max_vertices: 200000
   max_xatlas_charts: 20000
   # Hard mesh-size guard for GLB export; above these we skip GLB for that candidate altogether.
-  max_vertices_for_glb: 1000000
-  max_faces_for_glb: 2000000
+  max_vertices_for_glb: 2000000
+  max_faces_for_glb: 3000000
   smooth_mesh: true
   smooth_iterations: 5
   smooth_lambda: 0.5
@@ -110,6 +103,34 @@ glb_converter:
   color_saturation: 0.85
   # color_brightness: 1.0
   gpu: 0
+  # Auto-clamp GLB conversion params based on mesh size + free VRAM (safety).
+  # Defaults match the previous hardcoded behavior in pipeline.py.
+  auto_clamp:
+    enabled: true
+    large_vertices: 400000
+    large_faces: 800000
+    very_large_vertices: 1000000
+    very_large_faces: 2000000
+    low_vram_gb: 10.0
+    very_low_vram_gb: 6.0
+    large:
+      max_decimation_target: 100000
+      max_texture_size: 1536
+      max_subdivisions: 1
+      disable_remesh: false
+      disable_remesh_if_low_vram: true
+    very_large:
+      max_decimation_target: 60000
+      max_texture_size: 1024
+      max_subdivisions: 0
+      disable_remesh: true
+      disable_remesh_if_low_vram: true
+    oom_retry:
+      enabled: true
+      max_decimation_target: 70000
+      max_texture_size: 1024
+      disable_remesh: true
+      max_subdivisions: 0
 
 # Judge model settings
 judge:
@@ -138,4 +159,3 @@ model_versions:
     "Qwen/Qwen-Image-Edit-2511": "6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9"
     "lightx2v/Qwen-Image-Edit-2511-Lightning": "d74eba145674fd7e31b949324e148e21e7118abd"
     "fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA": "main"
-    "laion/CLIP-ViT-B-32-laion2B-s34B-b79K": "main"
