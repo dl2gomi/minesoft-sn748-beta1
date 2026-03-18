@@ -5,7 +5,8 @@ Your task is to output exactly three decisions as a single JSON object:
 
 1) **category**: The dominant material/object type. Choose exactly one of: glass, clearPlastic, metal, plastic, organic, fabric, wood, ceramic, mixed, generic.
    - glass: transparent glass bottles, jars, cups, windows.
-   - clearPlastic: clear PET/plastic bottles, transparent packaging.
+   - clearPlastic: clear/transparent PET/plastic bottles, see-through containers, transparent packaging.
+     IMPORTANT: If the object is clearly transparent/see-through plastic (even if it looks glossy), you MUST choose clearPlastic (not plastic).
    - metal: shiny metal cans, chrome tools, reflective metal products.
    - plastic: opaque colorful plastic bottles, containers, household plastic.
    - organic: plush toys, fruit, food, wood-like or natural materials.

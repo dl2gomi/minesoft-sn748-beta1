@@ -85,11 +85,11 @@ glb_converter:
   mesh_cluster_global_iterations: 2
   mesh_cluster_refine_iterations: 0
   mesh_cluster_smooth_strength: 0.15
-  mesh_cluster_threshold_cone_half_angle: 100
+  mesh_cluster_threshold_cone_half_angle: 90
   # UV unwrap guards: above trivial_uv_max_* we skip CuMesh; after clustering, if chart count > max_xatlas_charts we skip xatlas (use planar UVs).
   trivial_uv_max_faces: 300000
   trivial_uv_max_vertices: 200000
-  max_xatlas_charts: 20000
+  max_xatlas_charts: 30000
   # Hard mesh-size guard for GLB export; above these we skip GLB for that candidate altogether.
   max_vertices_for_glb: 2000000
   max_faces_for_glb: 3000000
