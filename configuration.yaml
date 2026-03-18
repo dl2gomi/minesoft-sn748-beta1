@@ -55,7 +55,7 @@ qwen:
 clarifier:
   enabled: true
   # If false, ignore category for GLB material mapping (no per-category presets).
-  use_category_clarification: false
+  use_category_clarification: true
   # category_config_path: optional path to category_config.yaml; default is pipeline_service/category_config.yaml
 
 # Background removal model settings
