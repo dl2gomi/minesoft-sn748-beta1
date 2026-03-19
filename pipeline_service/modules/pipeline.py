@@ -528,15 +528,44 @@ class GenerationPipeline:
                 num_samples=int(fallback_num_samples),
             )
             self._last_trellis_pipeline_type = TrellisPipeType.MODE_512.value
-            meshes = self.mesh_generator.generate(
-                model=self.mesh_pipeline,
-                request=TrellisRequest(
-                    image=images_without_background,
-                    seed=request.seed,
-                    params=fallback_overrides,
-                ),
-                default_params=default_params,
-            )
+            try:
+                meshes = self.mesh_generator.generate(
+                    model=self.mesh_pipeline,
+                    request=TrellisRequest(
+                        image=images_without_background,
+                        seed=request.seed,
+                        params=fallback_overrides,
+                    ),
+                    default_params=default_params,
+                )
+            except (torch.cuda.OutOfMemoryError, torch.AcceleratorError, RuntimeError) as e2:
+                msg2 = str(e2).lower()
+                if "out of memory" not in msg2 and "cuda" not in msg2 and "acceleratorerror" not in msg2:
+                    raise
+                # Second retry: keep num_samples, stay on pipeline=512, but reduce step counts to cut VRAM.
+                logger.warning(
+                    f"Trellis OOM again on pipeline=512; retrying with reduced steps (num_samples={int(fallback_num_samples)}): {e2}"
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                # Conservative reductions: these reduce compute/VRAM while preserving the 2-candidate contract.
+                reduced = TrellisParams.Overrides(
+                    pipeline_type=TrellisPipeType.MODE_512,
+                    num_samples=int(fallback_num_samples),
+                    sparse_structure_steps=max(4, int(getattr(default_params, "sparse_structure_steps", 12) or 12) // 2),
+                    shape_slat_steps=max(4, int(getattr(default_params, "shape_slat_steps", 12) or 12) // 2),
+                    tex_slat_steps=max(4, int(getattr(default_params, "tex_slat_steps", 12) or 12) // 2),
+                )
+                meshes = self.mesh_generator.generate(
+                    model=self.mesh_pipeline,
+                    request=TrellisRequest(
+                        image=images_without_background,
+                        seed=request.seed,
+                        params=reduced,
+                    ),
+                    default_params=default_params,
+                )
 
         logger.info(
             "Trellis pipeline decision summary: "
