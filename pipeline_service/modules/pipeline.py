@@ -494,10 +494,8 @@ class GenerationPipeline:
                 raise
 
             logger.warning(
-                "GLB conversion OOM on first attempt (category=%s); "
-                "retrying with lighter params based on mesh size/VRAM: %s",
-                object_category,
-                e,
+                f"GLB conversion OOM on first attempt (category={object_category}); "
+                f"retrying with lighter params based on mesh size/VRAM: {e}"
             )
             # Build a lighter override that keeps work on GPU but reduces memory pressure.
             base = params_filtered or GLBConverterParams.Overrides()
@@ -620,6 +618,137 @@ class GenerationPipeline:
                 glb_trellis_results.append(TrellisResult(file_bytes=glb_bytes))
                 glb_sizes.append(len(glb_bytes) if isinstance(glb_bytes, (bytes, bytearray)) else 0)
 
+        # Candidate filtering to avoid excessive chart fragmentation.
+        #
+        # Behavior (per user spec):
+        # - If all candidates have num_charts > max_xatlas_charts:
+        #   - if current Trellis pipeline is not "512": regenerate meshes with Trellis pipeline_type="512"
+        #   - if current Trellis pipeline is already "512": keep only candidate 0
+        # - If at least one candidate is <= max_xatlas_charts: drop candidates with num_charts > max_xatlas_charts
+        #   and proceed with the remaining candidates.
+        max_xatlas_charts = getattr(getattr(s, "glb_converter", None), "max_xatlas_charts", None)
+        if max_xatlas_charts is not None and max_xatlas_charts > 0 and uv_infos and glb_trellis_results:
+            def _num_charts(i: int) -> Optional[int]:
+                info = uv_infos[i]
+                if isinstance(info, dict):
+                    v = info.get("num_charts")
+                    return int(v) if v is not None else None
+                return None
+
+            def _is_over_threshold(i: int) -> bool:
+                """
+                'Over' means we should avoid / retry away from UVs that will likely
+                fall into trivial UV fallback due to xatlas chart explosion.
+                """
+                info = uv_infos[i]
+                if not isinstance(info, dict):
+                    return False
+                n = info.get("num_charts")
+                reason = info.get("reason")
+                if n is not None:
+                    try:
+                        return int(n) > max_xatlas_charts
+                    except (TypeError, ValueError):
+                        return False
+                # Some paths may set num_charts=None but still tag the reason as "charts".
+                # In that case, treat as "over" by spec.
+                return reason == "charts"
+
+            num_charts_list = [_num_charts(i) for i in range(len(glb_trellis_results))]
+            over_flags = [_is_over_threshold(i) for i in range(len(glb_trellis_results))]
+            all_over = bool(over_flags) and all(over_flags)
+
+            def _is_pipeline_512(val: object) -> bool:
+                if val is None:
+                    return False
+                s_val = str(getattr(val, "value", val))
+                return s_val == TrellisPipeType.MODE_512.value or s_val == "512"
+
+            current_pipeline_used = getattr(self, "_last_trellis_pipeline_type", None)
+            current_is_512 = _is_pipeline_512(current_pipeline_used)
+
+            if all_over:
+                logger.warning(
+                    f"All GLB candidates exceed max_xatlas_charts={max_xatlas_charts}; "
+                    f"uv_num_charts={num_charts_list}; current_pipeline_used={current_pipeline_used}"
+                )
+
+                if not current_is_512:
+                    # Retry Trellis generation with pipeline_type=512 (preserve num_samples and other overrides).
+                    logger.warning("Retrying Trellis meshes with pipeline_type=512 to avoid trivial UV fallback.")
+                    self._clean_gpu_memory()
+
+                    default_params = TrellisParams.from_settings(s.trellis)
+                    overrides_dict = (
+                        request.trellis_params.model_dump(exclude_none=True)
+                        if request.trellis_params
+                        else {}
+                    )
+                    overrides_dict["pipeline_type"] = TrellisPipeType.MODE_512
+                    trellis_overrides = (
+                        TrellisParams.Overrides(**overrides_dict) if overrides_dict else None
+                    )
+
+                    meshes = self.mesh_generator.generate(
+                        model=self.mesh_pipeline,
+                        request=TrellisRequest(
+                            image=images_without_background,
+                            seed=request.seed,
+                            params=trellis_overrides,
+                        ),
+                        default_params=default_params,
+                    )
+
+                    glb_trellis_results = []
+                    uv_infos = []
+                    glb_sizes = []
+                    for mesh in meshes:
+                        try:
+                            glb_bytes = self.convert_mesh_to_glb(
+                                mesh, request.glbconv_params, object_category, settings=s
+                            )
+                        except MeshTooLargeForGLB as e:
+                            logger.warning(f"Skipping GLB candidate due to oversized mesh after retry: {e}")
+                            continue
+                        uv_infos.append(getattr(self.glb_converter, "last_uv_unwrap_info", None))
+                        glb_trellis_results.append(TrellisResult(file_bytes=glb_bytes))
+                        glb_sizes.append(len(glb_bytes) if isinstance(glb_bytes, (bytes, bytearray)) else 0)
+
+                    # Update pipeline_used logging for the retry.
+                    self._last_trellis_pipeline_type = TrellisPipeType.MODE_512.value
+
+                    # Recompute over/under to decide whether to filter candidates further.
+                    num_charts_list = [_num_charts(i) for i in range(len(glb_trellis_results))]
+                    # Reuse the same "over" rule after retry.
+                    over_flags = [_is_over_threshold(i) for i in range(len(glb_trellis_results))]
+                    all_over = bool(over_flags) and all(over_flags)
+
+                    if all_over:
+                        logger.warning(
+                            f"After 512 retry, all candidates still exceed max_xatlas_charts={max_xatlas_charts}; "
+                            f"keeping candidate 0 only."
+                        )
+                        glb_trellis_results = glb_trellis_results[:1]
+                        uv_infos = uv_infos[:1]
+                        glb_sizes = glb_sizes[:1]
+                else:
+                    # Already on 512: keep candidate 0 only (avoid further trivial UV avoidance attempts).
+                    logger.warning("Pipeline already 512; keeping candidate 0 only to proceed.")
+                    glb_trellis_results = glb_trellis_results[:1]
+                    uv_infos = uv_infos[:1]
+                    glb_sizes = glb_sizes[:1]
+            else:
+                # At least one candidate is <= threshold: drop over-threshold candidates.
+                keep_indices = [i for i, over in enumerate(over_flags) if not over]
+                if keep_indices and len(keep_indices) != len(glb_trellis_results):
+                    logger.warning(
+                        f"Filtering GLB candidates by num_charts threshold={max_xatlas_charts}; "
+                        f"keeping indices={keep_indices}; uv_num_charts={num_charts_list}"
+                    )
+                    glb_trellis_results = [glb_trellis_results[i] for i in keep_indices]
+                    uv_infos = [uv_infos[i] for i in keep_indices]
+                    glb_sizes = [glb_sizes[i] for i in keep_indices]
+
         # Decide whether to run the judge based on GLB sizes and judge.enabled
         winner_index: int = 0
         duel_done = False
@@ -636,10 +765,9 @@ class GenerationPipeline:
             if too_large_indices:
                 # At least one candidate is too large: skip judge entirely and ignore those candidates.
                 logger.info(
-                    "Skipping judge due to large GLB(s): indices=%s, sizes=%s, threshold=%d bytes",
-                    sorted(too_large_indices),
-                    [glb_sizes[i] for i in sorted(too_large_indices)],
-                    max_bytes,
+                    f"Skipping judge due to large GLB(s): indices={sorted(too_large_indices)}, "
+                    f"sizes={[glb_sizes[i] for i in sorted(too_large_indices)]}, "
+                    f"threshold={max_bytes} bytes"
                 )
                 # Pick the smallest remaining candidate by size (or overall smallest if all are too large).
                 candidate_indices = [i for i in range(len(glb_trellis_results)) if i not in too_large_indices]
@@ -657,9 +785,8 @@ class GenerationPipeline:
                     else datetime.utcnow().strftime("%Y%m%d_%H%M%S")
                 )
                 logger.info(
-                    "Candidate renders will be saved to: %s (basename=%s_candidate_0.png, ...)",
-                    candidates_dir,
-                    candidates_basename,
+                    f"Candidate renders will be saved to: {candidates_dir} "
+                    f"(basename={candidates_basename}_candidate_0.png, ...)"
                 )
                 try:
                     self.duel_manager.save_candidate_renders(
