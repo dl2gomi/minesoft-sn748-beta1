@@ -8,6 +8,7 @@ class MeshRasterizationData(BaseModel):
     face_ids: IntegerTensor                # (H, W) indices of faces for each pixel (invalid=-1)
     positions: FloatTensor                 # (N_valid, 3) position of mesh for each valid pixel
     normals: Optional[FloatTensor] = None  # (N_valid, 3) surface normal for each valid pixel
+    tangents: Optional[FloatTensor] = None # (N_valid, 4) tangent attribute (tangent xyz + handedness w)
 
     @property
     def mask(self) -> BoolTensor:

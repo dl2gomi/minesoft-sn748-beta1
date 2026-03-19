@@ -3,19 +3,20 @@
 
 # GLBConverterParams overrides per category.
 # alpha_mode: OPAQUE = no transparency; BLEND = allow transparency (e.g. glass).
+# Temporarily set all alpha mode to OPAQUE: change it later
 glb_presets:
   glass:
     roughness_scale: 0.35
     roughness_bias: 0.05
     color_saturation: 0.9
     color_brightness: 1.0
-    alpha_mode: BLEND  # transparent glass should stay blended
+    alpha_mode: OPAQUE  # transparent glass should stay blended
   clearPlastic:
     roughness_scale: 0.45
     roughness_bias: 0.1
     color_saturation: 0.9
     color_brightness: 1.0
-    alpha_mode: BLEND  # clear PET-style plastics can be see-through
+    alpha_mode: OPAQUE  # clear PET-style plastics can be see-through
   metal:
     roughness_scale: 0.55
     roughness_bias: 0.10
@@ -57,7 +58,7 @@ glb_presets:
     roughness_bias: 0.10
     color_saturation: 0.9
     color_brightness: 0.98
-    alpha_mode: BLEND
+    alpha_mode: OPAQUE
   generic:
     roughness_scale: 0.75
     roughness_bias: 0.10

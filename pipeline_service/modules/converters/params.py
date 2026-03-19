@@ -1,4 +1,4 @@
-from typing import TypeAlias
+from typing import Optional, TypeAlias
 
 from schemas.overridable import OverridableModel
 from geometry.texturing.enums import AlphaMode
@@ -37,6 +37,15 @@ class GLBConverterParams(OverridableModel):
     roughness_bias: float = 0.0    # add to roughness after scale (e.g. 0.1 = floor)
     color_saturation: float = 1.0  # 1 = no change, <1 = desaturate
     color_brightness: float = 1.0  # 1 = no change, <1 = darker
+
+    # Normal map baking (tangent-space).
+    # Note: This implementation computes tangents from mesh topology + UVs.
+    bake_normal_map: bool = False
+    normal_texture_size: Optional[int] = None  # None => use texture_size
+    normal_strength: float = 1.0
+    # Your pipeline flips UV V during GLB export. When baking in UV-space,
+    # this typically requires inverting the normal map Y (green channel).
+    normal_map_flip_y: bool = True
     
     
     @classmethod

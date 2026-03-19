@@ -8,7 +8,12 @@ from geometry.texturing.schemas import AttributesMasked, MeshRasterizationData
 from flex_gemm.ops.grid_sample import grid_sample_3d
 
 
-def rasterize_mesh_data(mesh_data: MeshData, texture_size: int | Tuple[int,int], use_vertex_normals: bool = False) -> MeshRasterizationData:
+def rasterize_mesh_data(
+    mesh_data: MeshData,
+    texture_size: int | Tuple[int, int],
+    use_vertex_normals: bool = False,
+    use_vertex_tangents: bool = False,
+) -> MeshRasterizationData:
     """Rasterize the mesh shape onto the mesh UV space."""
     
     uvs = mesh_data.uvs
@@ -25,14 +30,43 @@ def rasterize_mesh_data(mesh_data: MeshData, texture_size: int | Tuple[int,int],
     uvs_ndc[:, 1] = -uvs_ndc[:, 1]
     uvs_ndc = uvs_ndc.unsqueeze(0) if uvs_ndc.dim() == 2 else uvs_ndc
     
+    # Normalize shapes:
+    # - vertices: (V,3) -> (1,V,3)
+    # - faces: (F,3) or (1,F,3) -> (F,3)
     if vertices.dim() == 2:
         vertices = vertices.unsqueeze(0)
     faces = faces.long() if faces.dim() == 2 else faces.squeeze(0).long()
 
     surflets = vertices
+    surflet_feat_dims: int = 3
     if use_vertex_normals:
-        vertex_normals = mesh_data.vertex_normals.view_as(vertices)
-        surflets = torch.cat((vertices, vertex_normals), dim=-1)
+        if mesh_data.vertex_normals is None:
+            raise ValueError("use_vertex_normals=True but mesh_data.vertex_normals is None")
+        vertex_normals = mesh_data.vertex_normals
+        # vertex_normals: (V,3) -> (1,V,3) to match vertices
+        if vertex_normals.dim() == 2:
+            vertex_normals = vertex_normals.unsqueeze(0)
+        vertex_normals = vertex_normals.to(vertices.dtype).to(vertices.device)
+        if vertex_normals.shape[:2] != vertices.shape[:2]:
+            raise ValueError(
+                f"vertex_normals shape {tuple(vertex_normals.shape)} does not match vertices {tuple(vertices.shape)}"
+            )
+        surflets = torch.cat((surflets, vertex_normals), dim=-1)
+        surflet_feat_dims += 3
+    if use_vertex_tangents:
+        if mesh_data.vertex_tangents is None:
+            raise ValueError("use_vertex_tangents=True but mesh_data.vertex_tangents is None")
+        vertex_tangents = mesh_data.vertex_tangents
+        # vertex_tangents: (V,4) -> (1,V,4) to match vertices
+        if vertex_tangents.dim() == 2:
+            vertex_tangents = vertex_tangents.unsqueeze(0)
+        vertex_tangents = vertex_tangents.to(vertices.dtype).to(vertices.device)
+        if vertex_tangents.shape[0] != vertices.shape[0] or vertex_tangents.shape[1] != vertices.shape[1]:
+            raise ValueError(
+                f"vertex_tangents shape {tuple(vertex_tangents.shape)} does not match vertices {tuple(vertices.shape)}"
+            )
+        surflets = torch.cat((surflets, vertex_tangents), dim=-1)
+        surflet_feat_dims += 4
 
     # Index by faces
     face_vertices_image = kaolin.ops.mesh.index_vertices_by_faces(uvs_ndc, faces)
@@ -62,10 +96,33 @@ def rasterize_mesh_data(mesh_data: MeshData, texture_size: int | Tuple[int,int],
     mask = face_idx[0] >= 0
 
     valid_surf = surf[mask]
-    valid_positions, valid_normals = valid_surf[...,:3], valid_surf[...,3:]
-    valid_normals = valid_normals if use_vertex_normals else None
+    # surf layout: [pos(3), normals(3)? , tangents(4)?] in the order we concatenated.
+    cursor = 0
+    valid_positions = valid_surf[..., cursor : cursor + 3]
+    cursor += 3
 
-    return MeshRasterizationData(face_ids=face_idx[0], positions=valid_positions, normals=valid_normals)
+    valid_normals = None
+    if use_vertex_normals:
+        valid_normals = valid_surf[..., cursor : cursor + 3]
+        cursor += 3
+
+    valid_tangents = None
+    if use_vertex_tangents:
+        valid_tangents = valid_surf[..., cursor : cursor + 4]
+        cursor += 4
+
+    # Ensure we return None for the fields the caller didn't request.
+    if not use_vertex_normals:
+        valid_normals = None
+    if not use_vertex_tangents:
+        valid_tangents = None
+
+    return MeshRasterizationData(
+        face_ids=face_idx[0],
+        positions=valid_positions,
+        normals=valid_normals,
+        tangents=valid_tangents,
+    )
 
 
 def map_mesh_rasterization(rast_data: MeshRasterizationData, mesh_data: MeshData, flip_vertex_normals: bool = False) -> MeshRasterizationData:

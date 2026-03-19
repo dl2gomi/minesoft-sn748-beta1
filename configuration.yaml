@@ -74,7 +74,8 @@ glb_converter:
   # Use BLEND so transparent objects (glass, plastics, bottles) can preserve
   # their alpha. The converter will automatically switch to OPAQUE when the
   # baked alpha channel is fully opaque for a given asset.
-  alpha_mode: "BLEND"
+  # Temporarily set all alpha mode to OPAQUE: change it later
+  alpha_mode: "OPAQUE"
   rescale: 1.0
   subdivisions: 1
   vertex_reproject: 0.1
@@ -101,15 +102,18 @@ glb_converter:
   roughness_bias: 0.1
   # Optional: reduce bright/saturated look (e.g. color_saturation: 0.85, color_brightness: 0.95)
   color_saturation: 0.85
+  bake_normal_map: true
+  normal_strength: 1.0
+  normal_map_flip_y: true
   # color_brightness: 1.0
   gpu: 0
   # Auto-clamp GLB conversion params based on mesh size + free VRAM (safety).
   # Defaults match the previous hardcoded behavior in pipeline.py.
   auto_clamp:
     enabled: true
-    large_vertices: 400000
-    large_faces: 800000
-    very_large_vertices: 1000000
+    large_vertices: 700000
+    large_faces: 1000000
+    very_large_vertices: 1400000
     very_large_faces: 2000000
     low_vram_gb: 10.0
     very_low_vram_gb: 6.0

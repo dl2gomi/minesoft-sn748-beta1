@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import io
+import json
+import struct
 import time
 from datetime import datetime
 from pathlib import Path
@@ -33,13 +35,123 @@ from modules.background_removal.enums import RMBGModelType
 from modules.grid_renderer.render import GridViewRenderer
 from modules.mesh_generator.mesh_generator_module import MeshGeneratorModule
 from modules.mesh_generator.trellis_pipeline import Trellis2MeshPipeline
-from modules.converters.glb_converter import GLBConverter, MeshTooLargeForGLB
+from modules.converters.glb_converter import GLBConverter, MeshTooLargeForGLB, MeshTooManyChartsForGLB
 from modules.judge.duel_manager import DuelManager
 from modules.judge.vllm_judge_pipeline import VllmJudgePipeline
 from libs.trellis2.representations.mesh.base import MeshWithVoxel
 from modules.utils import image_grid, secure_randint, set_random_seed, decode_image, to_png_base64, save_files
 from modules.decision import DecisionResponse, decide as vllm_decide
 from modules.decision.schemas import DEFAULT_DECISION
+
+def _pad4(b: bytes) -> bytes:
+    pad = (-len(b)) % 4
+    return b + (b" " * pad)
+
+
+def _glb_with_tangents(glb_bytes: bytes, *, tangents_v4_f32: bytes, vertex_count: int) -> bytes:
+    """
+    Inject a glTF-standard TANGENT attribute into a GLB.
+
+    Expects:
+    - glb_bytes: valid GLB (glTF 2.0) with JSON + BIN chunks.
+    - tangents_v4_f32: raw bytes of float32 tangents, shape (V,4) => length = V*16
+    - vertex_count: V (must match POSITION accessor count)
+    """
+    if len(glb_bytes) < 20:
+        return glb_bytes
+
+    # GLB header
+    magic, version, length = struct.unpack_from("<4sII", glb_bytes, 0)
+    if magic != b"glTF" or version != 2:
+        return glb_bytes
+
+    # Read first two chunks (JSON, BIN)
+    off = 12
+    if off + 8 > len(glb_bytes):
+        return glb_bytes
+    json_len, json_type = struct.unpack_from("<I4s", glb_bytes, off)
+    off += 8
+    if json_type != b"JSON":
+        return glb_bytes
+    json_chunk = glb_bytes[off : off + json_len]
+    off += json_len
+    off = (off + 3) & ~3
+
+    if off + 8 > len(glb_bytes):
+        return glb_bytes
+    bin_len, bin_type = struct.unpack_from("<I4s", glb_bytes, off)
+    off += 8
+    if bin_type != b"BIN\x00":
+        return glb_bytes
+    bin_chunk = glb_bytes[off : off + bin_len]
+
+    try:
+        tree = json.loads(json_chunk.decode("utf-8"))
+    except Exception:
+        return glb_bytes
+
+    # Find a mesh primitive to attach to (assume single mesh/primitive per your pipeline)
+    try:
+        prim = tree["meshes"][0]["primitives"][0]
+        attrs = prim.setdefault("attributes", {})
+    except Exception:
+        return glb_bytes
+
+    # If already present, do nothing
+    if "TANGENT" in attrs:
+        return glb_bytes
+
+    # Append tangent data to BIN chunk (4-byte aligned)
+    bin_new = bin_chunk + (b"\x00" * ((-len(bin_chunk)) % 4)) + tangents_v4_f32
+    bin_new = bin_new + (b"\x00" * ((-len(bin_new)) % 4))
+    tangent_byte_offset = len(bin_chunk) + ((-len(bin_chunk)) % 4)
+
+    # Ensure sections exist
+    tree.setdefault("bufferViews", [])
+    tree.setdefault("accessors", [])
+    tree.setdefault("buffers", [{"byteLength": 0}])
+
+    # Create bufferView for tangents
+    bv_index = len(tree["bufferViews"])
+    tree["bufferViews"].append(
+        {
+            "buffer": 0,
+            "byteOffset": int(tangent_byte_offset),
+            "byteLength": int(vertex_count * 16),
+        }
+    )
+
+    # Create accessor for tangents
+    acc_index = len(tree["accessors"])
+    tree["accessors"].append(
+        {
+            "componentType": 5126,  # FLOAT
+            "type": "VEC4",
+            "bufferView": bv_index,
+            "byteOffset": 0,
+            "count": int(vertex_count),
+        }
+    )
+
+    attrs["TANGENT"] = acc_index
+
+    # Update buffer byteLength
+    tree["buffers"][0]["byteLength"] = int(len(bin_new))
+
+    # Rebuild JSON chunk
+    json_new = json.dumps(tree, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    json_new_padded = _pad4(json_new)
+    bin_new_padded = bin_new + (b"\x00" * ((-len(bin_new)) % 4))
+
+    # Rebuild GLB
+    out = bytearray()
+    out += struct.pack("<4sII", b"glTF", 2, 0)  # placeholder length
+    out += struct.pack("<I4s", len(json_new_padded), b"JSON")
+    out += json_new_padded
+    out += struct.pack("<I4s", len(bin_new_padded), b"BIN\x00")
+    out += bin_new_padded
+    struct.pack_into("<I", out, 8, len(out))
+    return bytes(out)
 
 class GenerationPipeline:
     """
@@ -204,15 +316,38 @@ class GenerationPipeline:
         clarifier_score: Optional[float] = None
         clarifier_explanation: Optional[str] = None
 
+        def _is_cuda_oom(exc: BaseException) -> bool:
+            msg = str(exc).lower()
+            return (
+                isinstance(exc, torch.cuda.OutOfMemoryError)
+                or "out of memory" in msg
+                or "cuda" in msg
+            )
+
         # 1 Always canonicalize the input with the base prompt first.
         base_prompt = self.prompting_library.promptings["base"]
         logger.debug(f"Editing base view with prompt: {base_prompt}")
-        base_images = list(self.qwen_edit.edit_image(
-            model=self.qwen_pipeline,
-            prompt_image=image,
-            seed=seed,
-            prompting=base_prompt
-        ))
+        try:
+            base_images = list(
+                self.qwen_edit.edit_image(
+                    model=self.qwen_pipeline,
+                    prompt_image=image,
+                    seed=seed,
+                    prompting=base_prompt,
+                )
+            )
+        except Exception as e:
+            if _is_cuda_oom(e):
+                logger.warning(
+                    f"Qwen edit OOM during base edit; falling back to original image (no edit): {e}"
+                )
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                return [image], clarifier_score, False, "Qwen OOM: skipped edit"
+            raise
 
         multiview_mode = getattr(settings.trellis, "multiview_mode", "off")
         needs_multiview = False
@@ -255,13 +390,26 @@ class GenerationPipeline:
         for base_image in base_images:
             for prompt_text in views_prompt.prompt:
                 logger.debug(f"Editing view with prompt: {prompt_text}")
-                result = self.qwen_edit.edit_image(
-                    model=self.qwen_pipeline,
-                    prompt_image=base_image,
-                    seed=seed,
-                    prompting=prompt_text,
-                )
-                edited_images.extend(result)
+                try:
+                    result = self.qwen_edit.edit_image(
+                        model=self.qwen_pipeline,
+                        prompt_image=base_image,
+                        seed=seed,
+                        prompting=prompt_text,
+                    )
+                    edited_images.extend(result)
+                except Exception as e:
+                    if _is_cuda_oom(e):
+                        logger.warning(
+                            f"Qwen edit OOM during multiview edit; using base-edited images only: {e}"
+                        )
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        return list(base_images), clarifier_score, False, "Qwen OOM: skipped multiview edits"
+                    raise
 
         return edited_images, clarifier_score, True, clarifier_explanation
 
@@ -541,9 +689,29 @@ class GenerationPipeline:
         buffer = io.BytesIO()
         glb_mesh.export(file_obj=buffer, file_type="glb", extension_webp=False)
         buffer.seek(0)
-        
+
+        glb_bytes = buffer.getvalue()
+
+        # Inject TANGENT attribute for normal mapping if available.
+        tangents = getattr(self.glb_converter, "last_vertex_tangents", None)
+        if tangents is not None:
+            try:
+                # Apply the same coordinate conversion used for vertices/normals before export:
+                # swap Y/Z and invert Y -> (x, y, z) -> (x, z, -y)
+                t = tangents.astype("float32", copy=True)
+                t[:, 1], t[:, 2] = t[:, 2].copy(), -t[:, 1].copy()
+                # Handedness may need flipping due to reflection; keep as-is for now.
+                glb_bytes = _glb_with_tangents(
+                    glb_bytes,
+                    tangents_v4_f32=t.tobytes(order="C"),
+                    vertex_count=int(t.shape[0]),
+                )
+                logger.info(f"Injected glTF TANGENT attribute (V={int(t.shape[0])})")
+            except Exception as e:
+                logger.warning(f"Failed to inject TANGENT attribute: {e}")
+
         logger.info(f"GLB conversion time: {time.time() - start_time:.2f}s")
-        return buffer.getvalue()
+        return glb_bytes
 
     def prepare_outputs(
         self,
@@ -611,6 +779,12 @@ class GenerationPipeline:
                     glb_bytes = self.convert_mesh_to_glb(
                         mesh, request.glbconv_params, object_category, settings=s
                     )
+                except MeshTooManyChartsForGLB as e:
+                    # Avoid spending time on GLB conversion (textures/export) when we already know
+                    # this candidate will be filtered out due to chart explosion.
+                    uv_infos.append(getattr(self.glb_converter, "last_uv_unwrap_info", None))
+                    logger.warning(f"Skipping GLB candidate due to excessive UV charts: {e}")
+                    continue
                 except MeshTooLargeForGLB as e:
                     logger.warning(f"Skipping GLB candidate due to oversized mesh: {e}")
                     continue

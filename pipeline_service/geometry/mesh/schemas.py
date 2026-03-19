@@ -27,6 +27,9 @@ class MeshData(BaseModel):
     vertices: FloatTensor                            # (V, 3) vertex positions
     faces: IntegerTensor                             # (F, 3) face indices
     vertex_normals: Optional[FloatTensor] = None     # (V, 3) vertex normals (optional)
+    # Tangent-space basis for normal mapping.
+    # Convention: (tangent_x, tangent_y, tangent_z, handedness_w) where handedness_w is +/-1.
+    vertex_tangents: Optional[FloatTensor] = None    # (V, 4) tangent attribute (optional)
     uvs: Optional[FloatTensor] = None                # (V, 2) UV coordinates (optional)
     bvh: Optional[Internal[cumesh.cuBVH]] = None     # BVH tree for ray tracing and projection
 

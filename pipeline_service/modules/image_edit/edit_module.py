@@ -76,5 +76,17 @@ class EditModule:
             return results
             
         except Exception as e:
+            # If this is a CUDA OOM, clear cache so caller can recover/fallback.
+            msg = str(e).lower()
+            if (
+                isinstance(e, torch.cuda.OutOfMemoryError)
+                or "out of memory" in msg
+                or "cuda" in msg
+            ):
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
             logger.error(f"Error generating image: {e}")
-            raise e
+            raise

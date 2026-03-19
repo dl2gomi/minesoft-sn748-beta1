@@ -116,7 +116,10 @@ class DuelManager:
             path = out / f"{basename}_candidate_{i}.png"
             path.write_bytes(png_bytes)
 
-        logger.info("Saved %d duel candidate PNGs to %s (e.g. %s)", len(rendered), out, out / f"{basename}_candidate_0.png")
+        logger.info(
+            f"Saved {len(rendered)} duel candidate PNGs to {out} "
+            f"(e.g. {out / f'{basename}_candidate_0.png'})"
+        )
 
     async def judge_meshes(
         self,

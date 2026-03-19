@@ -16,6 +16,7 @@ from geometry.mesh.utils import sort_mesh, map_vertices_positions, count_boundar
 from geometry.mesh.subdivisions import subdivide_egdes
 from geometry.mesh.smoothing import taubin_smooth
 from geometry.texturing.utils import dilate_attributes, map_mesh_rasterization, rasterize_mesh_data, sample_grid_attributes
+from geometry.texturing.schemas import AttributesMasked
 from geometry.texturing.enums import AlphaMode
 from .params import GLBConverterParams
 from .settings import GLBConverterConfig
@@ -56,6 +57,15 @@ class MeshTooLargeForGLB(Exception):
     pass
 
 
+class MeshTooManyChartsForGLB(Exception):
+    """Raised when a mesh exceeds max_xatlas_charts (avoid expensive GLB conversion)."""
+
+    def __init__(self, num_charts: int, max_xatlas_charts: int):
+        super().__init__(f"num_charts={num_charts} > max_xatlas_charts={max_xatlas_charts}")
+        self.num_charts = int(num_charts)
+        self.max_xatlas_charts = int(max_xatlas_charts)
+
+
 class GLBConverter:
     """Converter for extracting and texturing meshes to GLB format."""
     DEFAULT_AABB = torch.as_tensor([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], dtype=torch.float32)
@@ -69,6 +79,9 @@ class GLBConverter:
         # Populated during convert() for the most recent mesh.
         # Shape: {"mode": "xatlas"|"trivial", "reason": str|None, "num_charts": int|None}
         self.last_uv_unwrap_info: dict | None = None
+        # Populated during convert() when normal baking computes tangents.
+        # Shape: (V, 4) float32, columns = (tx, ty, tz, w)
+        self.last_vertex_tangents: np.ndarray | None = None
     
     def convert(self, mesh: MeshWithVoxel, aabb: torch.Tensor = DEFAULT_AABB, params: GLBConverterParams = None) -> trimesh.Trimesh:
         """Convert the given mesh to a textured GLB format."""
@@ -77,6 +90,7 @@ class GLBConverter:
         params = self.default_params.overrided(params)
         logger.debug(f"Using GLB conversion parameters: {params}")
         self.last_uv_unwrap_info = None
+        self.last_vertex_tangents = None
 
          # Hard guard: if the mesh is extremely large, skip GLB generation for this candidate.
         num_vertices = int(mesh.vertices.shape[0])
@@ -95,8 +109,15 @@ class GLBConverter:
                 f"limits={params.max_vertices_for_glb}/{params.max_faces_for_glb})"
             )
 
-        # 1. Prepare original mesh data with BVH
-        original_mesh_data = self._prepare_original_mesh(mesh, aabb)
+        # 1. Prepare original mesh data with BVH.
+        # For normal map baking, we want smooth per-vertex normals on the original mesh
+        # so the baked normalTexture captures a meaningful "high vs low" difference.
+        want_original_vertex_normals = bool(getattr(params, "bake_normal_map", False))
+        original_mesh_data = self._prepare_original_mesh(
+            mesh,
+            aabb,
+            compute_vertex_normals=want_original_vertex_normals,
+        )
         
         # 2. Remesh if required (cleanup otherwise)
         if params.remesh:
@@ -109,6 +130,59 @@ class GLBConverter:
 
         # 4. subdivide unwrapped mesh
         mesh_data = self._subdivide_mesh(mesh_data, original_mesh_data, params)
+
+        # 4b. (Optional) compute and bake tangent-space normal texture
+        normal_texture: Optional[Image.Image] = None
+        if getattr(params, "bake_normal_map", False):
+            if mesh_data.vertex_normals is None or mesh_data.uvs is None:
+                logger.warning(
+                    "Skipping normal map baking because vertex_normals/uvs are missing."
+                )
+            else:
+                def _is_cuda_oom(exc: BaseException) -> bool:
+                    msg = str(exc).lower()
+                    return (
+                        isinstance(exc, torch.cuda.OutOfMemoryError)
+                        or "out of memory" in msg
+                        or "cuda" in msg
+                    )
+
+                try:
+                    t0_nm = time.time()
+                    mesh_data.vertex_tangents = self._compute_vertex_tangents(mesh_data)
+                    try:
+                        self.last_vertex_tangents = (
+                            mesh_data.vertex_tangents.detach().to("cpu").to(torch.float32).numpy()
+                        )
+                    except Exception:
+                        self.last_vertex_tangents = None
+                    logger.info(
+                        f"Normal map: computed tangents (V={int(mesh_data.vertices.shape[0])} "
+                        f"F={int(mesh_data.faces.shape[0])}) in {time.time() - t0_nm:.2f}s"
+                    )
+
+                    t1_nm = time.time()
+                    normal_texture = self._bake_normal_texture(
+                        mesh_data=mesh_data,
+                        original_mesh_data=original_mesh_data,
+                        params=params,
+                    )
+                    logger.info(
+                        f"Normal map: baked normalTexture size={getattr(normal_texture, 'size', None)} "
+                        f"in {time.time() - t1_nm:.2f}s"
+                    )
+                except Exception as e:
+                    if _is_cuda_oom(e):
+                        logger.warning(f"Normal map: OOM during baking; skipping normalTexture: {e}")
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        normal_texture = None
+                        self.last_vertex_tangents = None
+                    else:
+                        raise
         
         # 5. Rasterize attributes onto the mesh UVs
         attributes_layout = mesh.layout
@@ -118,10 +192,155 @@ class GLBConverter:
         base_color, orm_texture = self._texture_postprocess(attributes, attributes_layout, params)
 
         # 7. Create the textured mesh
-        textured_mesh = self._create_textured_mesh(mesh_data, base_color, orm_texture, params)
+        textured_mesh = self._create_textured_mesh(
+            mesh_data,
+            base_color,
+            orm_texture,
+            params,
+            normal_texture=normal_texture,
+        )
+        if normal_texture is not None:
+            logger.info("Normal map: attached normalTexture to GLB material")
 
         return textured_mesh
 
+    def _compute_vertex_tangents(self, mesh_data: MeshData) -> torch.Tensor:
+        """
+        Compute a MikkTSpace-like tangent basis from UVs + topology.
+
+        Returns a per-vertex tangent attribute of shape (V, 4):
+        (tangent_x, tangent_y, tangent_z, handedness_w) where handedness_w is +/- 1.
+        """
+        if mesh_data.vertex_normals is None:
+            raise ValueError("mesh_data.vertex_normals is required for tangent computation")
+        if mesh_data.uvs is None:
+            raise ValueError("mesh_data.uvs is required for tangent computation")
+
+        vertices = mesh_data.vertices
+        normals = F.normalize(mesh_data.vertex_normals, dim=-1, eps=1e-12)
+        uvs = mesh_data.uvs
+        faces = mesh_data.faces.long()
+
+        v_count = vertices.shape[0]
+        device = vertices.device
+        dtype = vertices.dtype
+
+        tan_accum = torch.zeros((v_count, 3), dtype=dtype, device=device)
+        bitan_accum = torch.zeros((v_count, 3), dtype=dtype, device=device)
+
+        i0 = faces[:, 0]
+        i1 = faces[:, 1]
+        i2 = faces[:, 2]
+
+        p0 = vertices[i0]
+        p1 = vertices[i1]
+        p2 = vertices[i2]
+
+        uv0 = uvs[i0]
+        uv1 = uvs[i1]
+        uv2 = uvs[i2]
+
+        e1 = p1 - p0
+        e2 = p2 - p0
+        duv1 = uv1 - uv0
+        duv2 = uv2 - uv0
+
+        den = duv1[:, 0] * duv2[:, 1] - duv1[:, 1] * duv2[:, 0]
+        mask = den.abs() > 1e-12
+        r = torch.zeros_like(den)
+        r[mask] = 1.0 / den[mask]
+
+        t = (e1 * duv2[:, 1:2] - e2 * duv1[:, 1:2]) * r[:, None]
+        b = (e2 * duv1[:, 0:1] - e1 * duv2[:, 0:1]) * r[:, None]
+
+        tan_accum.index_add_(0, i0, t)
+        tan_accum.index_add_(0, i1, t)
+        tan_accum.index_add_(0, i2, t)
+        bitan_accum.index_add_(0, i0, b)
+        bitan_accum.index_add_(0, i1, b)
+        bitan_accum.index_add_(0, i2, b)
+
+        t = tan_accum
+        n = normals
+        t = t - n * (t * n).sum(dim=-1, keepdim=True)
+        t = F.normalize(t, dim=-1, eps=1e-12)
+
+        b = bitan_accum
+        handed = torch.sum(torch.cross(n, t, dim=-1) * b, dim=-1)
+        w = torch.where(
+            handed < 0,
+            torch.tensor(-1.0, dtype=dtype, device=device),
+            torch.tensor(1.0, dtype=dtype, device=device),
+        )[:, None]
+
+        return torch.cat([t, w], dim=-1)
+
+    def _bake_normal_texture(
+        self,
+        *,
+        mesh_data: MeshData,
+        original_mesh_data: MeshDataWithAttributeGrid,
+        params: GLBConverterParams,
+    ) -> Image.Image:
+        """
+        Bake a tangent-space normal map (RGB) into UV space.
+        """
+        if mesh_data.vertex_tangents is None:
+            raise ValueError("mesh_data.vertex_tangents is required for normal baking")
+        if mesh_data.vertex_normals is None:
+            raise ValueError("mesh_data.vertex_normals is required for normal baking")
+        if mesh_data.uvs is None:
+            raise ValueError("mesh_data.uvs is required for normal baking")
+
+        texture_size = int(params.normal_texture_size) if params.normal_texture_size else int(params.texture_size)
+
+        t0 = time.time()
+        rast_low = rasterize_mesh_data(
+            mesh_data,
+            texture_size,
+            use_vertex_normals=True,
+            use_vertex_tangents=True,
+        )
+        assert rast_low.normals is not None
+        assert rast_low.tangents is not None
+
+        rast_high = map_mesh_rasterization(rast_low, original_mesh_data, flip_vertex_normals=True)
+        assert rast_high.normals is not None
+
+        n_low = F.normalize(rast_low.normals, dim=-1, eps=1e-12)
+        t_xyz = rast_low.tangents[:, :3]
+        w = rast_low.tangents[:, 3:4]
+
+        t_xyz = t_xyz - n_low * (t_xyz * n_low).sum(dim=-1, keepdim=True)
+        t_xyz = F.normalize(t_xyz, dim=-1, eps=1e-12)
+        b_xyz = torch.cross(n_low, t_xyz, dim=-1) * w
+
+        n_high = F.normalize(rast_high.normals, dim=-1, eps=1e-12)
+
+        nx = torch.sum(n_high * t_xyz, dim=-1)
+        ny = torch.sum(n_high * b_xyz, dim=-1)
+        nz = torch.sum(n_high * n_low, dim=-1)
+        n_ts = torch.stack([nx, ny, nz], dim=-1)
+
+        if params.normal_strength != 1.0:
+            n_ts = torch.cat([n_ts[:, :2] * float(params.normal_strength), n_ts[:, 2:3]], dim=-1)
+            n_ts = F.normalize(n_ts, dim=-1, eps=1e-12)
+
+        if params.normal_map_flip_y:
+            n_ts[:, 1] = -n_ts[:, 1]
+
+        attrs = AttributesMasked(values=n_ts, mask=rast_low.mask)
+        filled_ts = dilate_attributes(attrs, self.DILATION_KERNEL_SIZE)
+        filled_ts = F.normalize(filled_ts, dim=-1, eps=1e-12)
+
+        rgb = (filled_ts * 0.5 + 0.5).clamp(0.0, 1.0)
+        normal_texture = to_pil_image(rgb.permute(2, 0, 1).contiguous().cpu())
+        # This is intentionally a single concise line (no tqdm) to keep logs readable.
+        logger.info(
+            f"Normal map: baked (tex={int(texture_size)}x{int(texture_size)}, "
+            f"valid_pixels={int(rast_low.mask.sum().item())}) in {time.time() - t0:.2f}s"
+        )
+        return normal_texture
 
     def _prepare_original_mesh(self, mesh: MeshWithVoxel, aabb: torch.Tensor, compute_vertex_normals: bool = False) -> MeshDataWithAttributeGrid:
         """
@@ -318,10 +537,10 @@ class GLBConverter:
             if num_charts > params.max_xatlas_charts:
                 logger.warning(
                     f"Chart count {num_charts} > max_xatlas_charts ({params.max_xatlas_charts}); "
-                    "using trivial UVs to avoid xatlas segfault."
+                    "skipping GLB conversion for this candidate to avoid expensive trivial-UV fallback."
                 )
                 self.last_uv_unwrap_info = {"mode": "trivial", "reason": "charts", "num_charts": int(num_charts)}
-                return _trivial_uvs_and_normals_gpu(mesh_data.vertices, mesh_data.faces, self.device)
+                raise MeshTooManyChartsForGLB(int(num_charts), int(params.max_xatlas_charts))
 
             out_vertices, out_faces, out_uvs, out_vmaps = cumesh_mesh.uv_unwrap(
                 compute_charts_kwargs=compute_charts_kwargs,
@@ -446,7 +665,14 @@ class GLBConverter:
         logger.debug(f"Done finalizing mesh textures | Time: {time.time() - start_time:.2f}s")
         return base_color_texture, orm_texture
 
-    def _create_textured_mesh(self, mesh_data: MeshData, base_color: Image.Image, orm_texture: Image.Image, params: GLBConverterParams) -> trimesh.Trimesh:
+    def _create_textured_mesh(
+        self,
+        mesh_data: MeshData,
+        base_color: Image.Image,
+        orm_texture: Image.Image,
+        params: GLBConverterParams,
+        normal_texture: Optional[Image.Image] = None,
+    ) -> trimesh.Trimesh:
         """Create a textured trimesh mesh from the mesh data and textures."""
         
         logger.debug("Creating textured mesh")
@@ -459,6 +685,7 @@ class GLBConverter:
         material = trimesh.visual.material.PBRMaterial(
             baseColorTexture=base_color,
             baseColorFactor=np.array([1.0, 1.0, 1.0, 1.0]),
+            normalTexture=normal_texture,
             metallicRoughnessTexture=orm_texture,
             roughnessFactor=1.0,
             metallicFactor=1.0,
